@@ -358,16 +358,35 @@ function browserTTS(text,opts={}){
   });
 }
 
-// ฟังก์ชันหลัก: ลอง Google ก่อน ถ้าไม่ได้ใช้ browser
-// opts: {voiceName, rate, engine:'google'|'browser'|'auto'}
+// ตรวจว่ารันอยู่ในแอป Android (มี TTS bridge)
+function hasNativeTTS(){
+  try{ return !!(window.AndroidTTS && window.AndroidTTS.isAvailable && window.AndroidTTS.isAvailable()); }
+  catch(e){ return false; }
+}
+function nativeTTS(text,rate){
+  return new Promise((resolve)=>{
+    try{
+      window.AndroidTTS.speak(text, rate||1.0);
+      // เนทีฟพูดเอง ประเมินเวลาคร่าวจากความยาวข้อความ เพื่อคืนเสียงวิดีโอ
+      const ms = Math.max(2000, Math.min(12000, text.length*120));
+      setTimeout(()=>resolve(true), ms);
+    }catch(e){ resolve(false); }
+  });
+}
+
+// ฟังก์ชันหลัก: แอป Android → เนทีฟ / เว็บ → Google หรือ browser
+// opts: {voiceName, rate, engine:'native'|'google'|'browser'|'auto'}
 async function speakThai(text,opts={}){
   if(!text||!text.trim()) return;
+  // ถ้าอยู่ในแอป Android ใช้เสียงเนทีฟเสมอ (เสียงไทยในเครื่อง — ดีสุดบน Mi Box)
+  if(hasNativeTTS()){ await nativeTTS(text,opts.rate); return; }
   const engine=opts.engine||'auto';
   if(engine==='browser'){ await browserTTS(text,opts); return; }
   const ok=await googleTTS(text,opts.rate);
   if(!ok && engine!=='google'){ await browserTTS(text,opts); }
 }
 function stopSpeak(){
+  if(hasNativeTTS()){ try{window.AndroidTTS.stop();}catch(e){} }
   _ttsToken++;
   if(_ttsAudio){ try{_ttsAudio.pause();}catch(e){} }
   if('speechSynthesis' in window){ try{window.speechSynthesis.cancel();}catch(e){} }
@@ -1011,6 +1030,9 @@ function TVView(){
         <h3 className="font-bold display-font">ตั้งค่าเสียงเรียกคิว</h3>
         <button onClick={()=>setShowVoicePanel(false)} className="text-[var(--sub)] hover:text-[var(--txt)] text-sm">ปิด ✕</button>
       </div>
+      {(typeof window!=='undefined' && window.AndroidTTS) && <div className="bg-[var(--teal)]/15 text-[var(--teal)] border border-[var(--teal)]/40 rounded-xl p-3 text-sm mb-4">
+        ✓ กำลังใช้แอป Android — เสียงเรียกคิวใช้เสียงไทยในเครื่องโดยตรง (ไม่ต้องตั้งค่าด้านล่าง)
+      </div>}
       <div className="grid sm:grid-cols-3 gap-3 mb-4">
         <button onClick={()=>setEngine('auto')} className={`p-4 rounded-xl border text-left ${engine==='auto'?'border-[var(--amber)] bg-[var(--amber)]/5':'border-[var(--line)] bg-[var(--ink)]'}`}>
           <div className="font-bold flex items-center gap-2">{engine==='auto'&&<span className="text-[var(--teal)]">✓</span>}⭐ อัตโนมัติ</div>
