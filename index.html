@@ -278,7 +278,11 @@ function getThaiVoices(){
   if(!('speechSynthesis' in window) || !window.speechSynthesis.getVoices) return [];
   try{
     const voices = window.speechSynthesis.getVoices();
-    return (voices||[]).filter(v=>(v.lang||'').toLowerCase().startsWith('th'));
+    return (voices||[]).filter(v=>{
+      const lang=(v.lang||'').toLowerCase().replace('_','-');
+      const name=(v.name||'').toLowerCase();
+      return lang.startsWith('th') || name.includes('thai') || name.includes('ไทย');
+    });
   }catch(e){ return []; }
 }
 function pickThaiVoice(){
@@ -337,18 +341,18 @@ function browserTTS(text,opts={}){
   return new Promise((resolve)=>{
     if(!('speechSynthesis' in window)){ resolve(false); return; }
     try{
-      window.speechSynthesis.cancel();
+      try{window.speechSynthesis.cancel();}catch(e){}
       const u=new SpeechSynthesisUtterance(text);
       let v=null;
-      if(opts.voiceName){ v=window.speechSynthesis.getVoices().find(x=>x.name===opts.voiceName); }
+      if(opts.voiceName){ v=(window.speechSynthesis.getVoices()||[]).find(x=>x.name===opts.voiceName); }
       if(!v) v=pickThaiVoice();
       if(v) u.voice=v;
       u.lang='th-TH'; u.rate=opts.rate||0.9; u.pitch=1.0; u.volume=1.0;
       let done=false;
       u.onend=()=>{ if(!done){done=true; resolve(true);} };
       u.onerror=()=>{ if(!done){done=true; resolve(false);} };
-      window.speechSynthesis.speak(u);
-      // กันค้าง: ถ้าไม่จบใน 12 วิ ถือว่าจบ
+      // หน่วงสั้นๆ ให้ cancel เคลียร์ก่อน (กัน Android TV WebView ตัดเสียง)
+      setTimeout(()=>{ try{window.speechSynthesis.speak(u);}catch(e){ if(!done){done=true;resolve(false);} } }, 120);
       setTimeout(()=>{ if(!done){done=true; resolve(true);} }, 12000);
     }catch(e){ resolve(false); }
   });
@@ -875,7 +879,7 @@ function AdminView(){
 function TVView(){
   const {tickets,calling,speakReq,playlist,playMode} = useContext(Store);
   const [started,setStarted] = useState(false);
-  const [engine,setEngine] = useState('auto'); // 'auto' | 'google' | 'browser'
+  const [engine,setEngine] = useState('browser'); // 'auto' | 'google' | 'browser'
   const [rate,setRate] = useState(0.95);
   const [thaiVoices,setThaiVoices] = useState([]);
   const [voiceName,setVoiceName] = useState('');
