@@ -42,7 +42,10 @@
 const {useState,useEffect,useRef,useCallback,createContext,useContext} = React;
 
 /* ---------- Shared store via BroadcastChannel + in-memory ---------- */
-const CH = new BroadcastChannel('queue-system');
+// guard: บางเบราว์เซอร์ (Android TV/WebView เก่า) ไม่มี BroadcastChannel
+const CH = (typeof BroadcastChannel!=='undefined')
+  ? new BroadcastChannel('queue-system')
+  : { postMessage(){}, onmessage:null, close(){} };
 const Store = createContext(null);
 
 const DEFAULT_STATUSES = [
@@ -260,10 +263,13 @@ function StoreProvider({children}){
   return <Store.Provider value={{tickets,trips,calling,history,speakReq,statuses,playlist,playMode,addTicket,updateTicket,removeTicket,setTripsAll,updateTrip,addHistory,setHistoryAll,setCall,requestSpeak,addStatus,addVideo,removeVideo,setMode,setPlaylistAll}}>{children}</Store.Provider>;
 }
 
-/* ---------- Thai TTS ---------- */
+/* ---------- Thai TTS (Google TTS หลัก + speechSynthesis สำรอง) ---------- */
 function getThaiVoices(){
-  const voices = window.speechSynthesis.getVoices();
-  return voices.filter(v=>(v.lang||'').toLowerCase().startsWith('th'));
+  if(!('speechSynthesis' in window) || !window.speechSynthesis.getVoices) return [];
+  try{
+    const voices = window.speechSynthesis.getVoices();
+    return (voices||[]).filter(v=>(v.lang||'').toLowerCase().startsWith('th'));
+  }catch(e){ return []; }
 }
 function pickThaiVoice(){
   const th = getThaiVoices();
@@ -271,20 +277,78 @@ function pickThaiVoice(){
   const pref = th.find(v=>/google|premium|natural|enhanced|online/i.test(v.name));
   return pref || th[0];
 }
-// opts: {voiceName, rate}
-function speakThai(text,opts={}){
-  if(!('speechSynthesis' in window)) return;
-  window.speechSynthesis.cancel();
-  const u = new SpeechSynthesisUtterance(text);
-  let v=null;
-  if(opts.voiceName){ v=window.speechSynthesis.getVoices().find(x=>x.name===opts.voiceName); }
-  if(!v) v=pickThaiVoice();
-  if(v) u.voice = v;
-  u.lang='th-TH';
-  u.rate=opts.rate||0.85;
-  u.pitch=1.0;
-  u.volume=1.0;
-  window.speechSynthesis.speak(u);
+
+// แบ่งข้อความยาวเป็นชิ้น ≤200 ตัวอักษร (ข้อจำกัด Google TTS)
+function ttsChunks(text){
+  const words=text.trim().split(/\s+/);
+  const chunks=[]; let cur='';
+  for(const w of words){
+    if((cur+' '+w).trim().length>180){ if(cur)chunks.push(cur.trim()); cur=w; }
+    else cur=(cur+' '+w).trim();
+  }
+  if(cur)chunks.push(cur.trim());
+  return chunks.length?chunks:[text];
+}
+
+// audio กลางสำหรับ Google TTS
+let _ttsAudio = null;
+let _ttsToken = 0;
+
+// เล่นด้วย Google Translate TTS — คืน Promise(true=สำเร็จ, false=ล้มเหลว)
+function googleTTS(text,rate){
+  return new Promise((resolve)=>{
+    try{
+      const chunks=ttsChunks(text);
+      const myToken=++_ttsToken;
+      if(_ttsAudio){ try{_ttsAudio.pause();}catch(e){} }
+      let i=0;
+      const a=new Audio();
+      _ttsAudio=a;
+      a.playbackRate = rate&&rate<1 ? Math.max(0.7,rate+0.1) : 1; // ชดเชยให้ไม่ช้าเกิน
+      let failed=false;
+      const playNext=()=>{
+        if(myToken!==_ttsToken){ resolve(true); return; } // ถูกแทนที่
+        if(i>=chunks.length){ resolve(!failed); return; }
+        const part=chunks[i++];
+        a.src=`https://translate.google.com/translate_tts?ie=UTF-8&tl=th&client=tw-ob&q=${encodeURIComponent(part)}`;
+        a.play().catch(()=>{ failed=true; resolve(false); });
+      };
+      a.onended=playNext;
+      a.onerror=()=>{ failed=true; resolve(false); };
+      playNext();
+    }catch(e){ resolve(false); }
+  });
+}
+
+// เล่นด้วย speechSynthesis (สำรอง)
+function browserTTS(text,opts={}){
+  if(!('speechSynthesis' in window)) return false;
+  try{
+    window.speechSynthesis.cancel();
+    const u=new SpeechSynthesisUtterance(text);
+    let v=null;
+    if(opts.voiceName){ v=window.speechSynthesis.getVoices().find(x=>x.name===opts.voiceName); }
+    if(!v) v=pickThaiVoice();
+    if(v) u.voice=v;
+    u.lang='th-TH'; u.rate=opts.rate||0.85; u.pitch=1.0; u.volume=1.0;
+    window.speechSynthesis.speak(u);
+    return true;
+  }catch(e){ return false; }
+}
+
+// ฟังก์ชันหลัก: ลอง Google ก่อน ถ้าไม่ได้ใช้ browser
+// opts: {voiceName, rate, engine:'google'|'browser'|'auto'}
+async function speakThai(text,opts={}){
+  if(!text||!text.trim()) return;
+  const engine=opts.engine||'auto';
+  if(engine==='browser'){ browserTTS(text,opts); return; }
+  const ok=await googleTTS(text,opts.rate);
+  if(!ok && engine!=='google'){ browserTTS(text,opts); }
+}
+function stopSpeak(){
+  _ttsToken++;
+  if(_ttsAudio){ try{_ttsAudio.pause();}catch(e){} }
+  if('speechSynthesis' in window){ try{window.speechSynthesis.cancel();}catch(e){} }
 }
 // แปลงเบอร์รถให้อ่านชัด: แยกตัวเลขทีละหลัก เว้นวรรค เช่น "212" → "2 1 2"
 function spellCarNo(carNo){
@@ -793,9 +857,10 @@ function AdminView(){
 function TVView(){
   const {tickets,calling,speakReq,playlist,playMode} = useContext(Store);
   const [started,setStarted] = useState(false);
-  const [voiceName,setVoiceName] = useState('');
-  const [rate,setRate] = useState(0.85);
+  const [engine,setEngine] = useState('google'); // 'google' | 'browser'
+  const [rate,setRate] = useState(0.95);
   const [thaiVoices,setThaiVoices] = useState([]);
+  const [voiceName,setVoiceName] = useState('');
   const [showVoicePanel,setShowVoicePanel] = useState(false);
   const [apiFailed,setApiFailed] = useState(false);
   const lastSpoke = useRef(null);
@@ -809,10 +874,11 @@ function TVView(){
 
   // โหลดรายชื่อเสียงไทย
   useEffect(()=>{
+    if(!('speechSynthesis' in window)) return;
     const load=()=>{ const v=getThaiVoices(); setThaiVoices(v); if(!voiceName){const p=pickThaiVoice(); if(p)setVoiceName(p.name);} };
     load();
-    window.speechSynthesis.onvoiceschanged=load;
-    return ()=>{window.speechSynthesis.onvoiceschanged=null;};
+    try{ window.speechSynthesis.onvoiceschanged=load; }catch(e){}
+    return ()=>{ try{window.speechSynthesis.onvoiceschanged=null;}catch(e){} };
   },[]);
 
   // โหลด YouTube IFrame API หลังกดเริ่ม
@@ -872,20 +938,27 @@ function TVView(){
     duckAndSpeak(speakReq.text);
   },[speakReq,started]);
 
-  const duckAndSpeak=(text)=>{
+  const duckAndSpeak=async(text)=>{
     const p=playerRef.current;
-    // หรี่เสียงวิดีโอ (ไม่หยุด)
     if(p&&playerReady.current){ try{p.setVolume(8);}catch(e){} }
     const restore=()=>{ if(p&&playerReady.current){ try{p.setVolume(100);}catch(e){} } };
-    // พูด 2 รอบ แล้วคืนเสียง
-    speakThai(text,{voiceName,rate});
-    setTimeout(()=>speakThai(text,{voiceName,rate}), 2600);
+    const opts={voiceName,rate,engine};
+    try{
+      await speakThai(text,opts);            // รอบ 1 (รอจบ)
+      await new Promise(r=>setTimeout(r,400));
+      await speakThai(text,opts);            // รอบ 2
+    }catch(e){}
     clearTimeout(restoreTimer.current);
-    restoreTimer.current=setTimeout(restore, 6000);
+    restoreTimer.current=setTimeout(restore, 800);
   };
 
-  const startShow=()=>{ setStarted(true); /* ปลดล็อกเสียง TTS ด้วย gesture */ try{speakThai(' ',{voiceName,rate});}catch(e){} };
-  const previewVoice=(name)=>{ speakThai('เชิญคุณ สมชาย รถเบอร์ 2 1 2 รับตั๋วครับ',{voiceName:name,rate}); };
+  const startShow=()=>{
+    setStarted(true);
+    // ปลดล็อกเสียงด้วย user gesture: เล่นเสียงสั้นๆ ทั้งสอง engine
+    try{ const a=new Audio(); a.src='data:audio/mpeg;base64,//uQxAAAAAAAAAAAAAAAAAAAAAAAWGluZwAAAA8AAAACAAACcQCA'; a.play().catch(()=>{}); }catch(e){}
+    speakThai('เริ่มระบบเรียกคิว',{engine,rate});
+  };
+  const previewVoice=()=>{ speakThai('เชิญคุณ สมชาย รถเบอร์ 2 1 2 รับตั๋วครับ',{engine,voiceName,rate}); };
 
   // หน้าจอเริ่มต้น: ปุ่มใหญ่กดด้วยรีโมท
   if(!started){
@@ -909,25 +982,36 @@ function TVView(){
 
     {showVoicePanel && <div className="bg-[var(--panel)] border border-[var(--line)] rounded-2xl p-5 mb-5 slideup">
       <div className="flex items-center justify-between mb-3">
-        <h3 className="font-bold display-font">เลือกเสียงเรียกคิว (ภาษาไทย)</h3>
+        <h3 className="font-bold display-font">ตั้งค่าเสียงเรียกคิว</h3>
         <button onClick={()=>setShowVoicePanel(false)} className="text-[var(--sub)] hover:text-[var(--txt)] text-sm">ปิด ✕</button>
       </div>
-      {thaiVoices.length===0
-        ? <div className="text-sm text-[var(--red)] bg-[var(--ink)] rounded-xl p-4">เครื่องนี้ไม่มีเสียงภาษาไทย — ใช้เสียงเริ่มต้นของเบราว์เซอร์</div>
-        : <div className="space-y-2">
-            <div className="text-sm text-[var(--sub)] mb-2">พบเสียงไทย {thaiVoices.length} เสียง</div>
+      <div className="grid sm:grid-cols-2 gap-3 mb-4">
+        <button onClick={()=>setEngine('google')} className={`p-4 rounded-xl border text-left ${engine==='google'?'border-[var(--amber)] bg-[var(--amber)]/5':'border-[var(--line)] bg-[var(--ink)]'}`}>
+          <div className="font-bold flex items-center gap-2">{engine==='google'&&<span className="text-[var(--teal)]">✓</span>}🌐 Google (แนะนำ)</div>
+          <div className="text-xs text-[var(--sub)] mt-1">เสียงไทยชัด เหมือนกันทุกเครื่อง ใช้ได้บน Mi Box/Android TV · ต้องต่อเน็ต</div>
+        </button>
+        <button onClick={()=>setEngine('browser')} className={`p-4 rounded-xl border text-left ${engine==='browser'?'border-[var(--amber)] bg-[var(--amber)]/5':'border-[var(--line)] bg-[var(--ink)]'}`}>
+          <div className="font-bold flex items-center gap-2">{engine==='browser'&&<span className="text-[var(--teal)]">✓</span>}💻 เบราว์เซอร์</div>
+          <div className="text-xs text-[var(--sub)] mt-1">ใช้เสียงในเครื่อง (เลือกเสียงได้) · บางเครื่องอาจไม่มีเสียงไทย</div>
+        </button>
+      </div>
+
+      {engine==='browser' && (thaiVoices.length===0
+        ? <div className="text-sm text-[var(--red)] bg-[var(--ink)] rounded-xl p-4 mb-3">เครื่องนี้ไม่มีเสียงภาษาไทยในเบราว์เซอร์ — แนะนำให้ใช้ Google แทน</div>
+        : <div className="space-y-2 mb-3">
+            <div className="text-sm text-[var(--sub)]">เสียงไทยในเครื่อง {thaiVoices.length} เสียง</div>
             {thaiVoices.map(v=>(
               <div key={v.name} className={`flex items-center gap-3 p-3 rounded-xl border ${voiceName===v.name?'border-[var(--amber)] bg-[var(--amber)]/5':'border-[var(--line)] bg-[var(--ink)]'}`}>
-                <button onClick={()=>previewVoice(v.name)} className="w-9 h-9 rounded-full bg-[var(--amber)] text-black flex items-center justify-center hover:bg-[var(--amber2)] shrink-0">▶</button>
+                <button onClick={()=>setVoiceName(v.name)} className={`px-3 py-1.5 rounded-lg text-xs font-semibold shrink-0 ${voiceName===v.name?'bg-[var(--teal)]/20 text-[var(--teal)] border border-[var(--teal)]/40':'bg-[var(--panel2)] border border-[var(--line)]'}`}>{voiceName===v.name?'✓':'เลือก'}</button>
                 <div className="flex-1 min-w-0"><div className="font-medium truncate">{v.name}</div><div className="text-xs text-[var(--sub)]">{v.lang}{v.localService?' · ในเครื่อง':' · ออนไลน์'}</div></div>
-                <button onClick={()=>setVoiceName(v.name)} className={`px-3 py-1.5 rounded-lg text-xs font-semibold shrink-0 ${voiceName===v.name?'bg-[var(--teal)]/20 text-[var(--teal)] border border-[var(--teal)]/40':'bg-[var(--panel2)] border border-[var(--line)] hover:border-[var(--amber)]'}`}>{voiceName===v.name?'✓ ใช้อยู่':'เลือก'}</button>
               </div>
             ))}
-          </div>}
-      <div className="mt-4 pt-4 border-t border-[var(--line)] flex items-center gap-3">
+          </div>)}
+
+      <div className="pt-4 border-t border-[var(--line)] flex items-center gap-3">
         <span className="text-sm text-[var(--sub)] whitespace-nowrap">ความเร็ว: {rate.toFixed(2)}x</span>
-        <input type="range" min="0.6" max="1.2" step="0.05" value={rate} onChange={e=>setRate(+e.target.value)} className="flex-1 accent-[var(--amber)]" />
-        <button onClick={()=>previewVoice(voiceName)} className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-[var(--panel2)] border border-[var(--line)] hover:border-[var(--amber)] whitespace-nowrap">▶ ทดสอบ</button>
+        <input type="range" min="0.7" max="1.2" step="0.05" value={rate} onChange={e=>setRate(+e.target.value)} className="flex-1 accent-[var(--amber)]" />
+        <button onClick={previewVoice} className="px-4 py-2 rounded-lg text-sm font-semibold bg-[var(--amber)] text-black hover:bg-[var(--amber2)] whitespace-nowrap">▶ ทดสอบเสียง</button>
       </div>
     </div>}
 
@@ -1064,7 +1148,25 @@ function App(){
   </StoreProvider>;
 }
 
-ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+class ErrorBoundary extends React.Component{
+  constructor(p){ super(p); this.state={err:null}; }
+  static getDerivedStateFromError(err){ return {err}; }
+  componentDidCatch(err,info){ console.error('App error:',err,info); }
+  render(){
+    if(this.state.err){
+      return <div style={{minHeight:'100vh',background:'#0c1420',color:'#e6eef8',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',padding:'24px',textAlign:'center',fontFamily:'sans-serif'}}>
+        <div style={{fontSize:'48px',marginBottom:'12px'}}>⚠️</div>
+        <h2 style={{fontSize:'22px',marginBottom:'8px'}}>เกิดข้อผิดพลาดในการแสดงผล</h2>
+        <p style={{color:'#7e98b5',marginBottom:'16px',maxWidth:'480px'}}>เบราว์เซอร์นี้อาจไม่รองรับบางฟีเจอร์ ลองเปิดด้วย Chrome เวอร์ชันล่าสุด หรือบนคอมพิวเตอร์</p>
+        <pre style={{color:'#ff5d6c',fontSize:'12px',whiteSpace:'pre-wrap',maxWidth:'90%',overflow:'auto'}}>{String(this.state.err&&this.state.err.message||this.state.err)}</pre>
+        <button onClick={()=>location.reload()} style={{marginTop:'20px',background:'#f5a623',color:'#000',fontWeight:'bold',padding:'12px 28px',borderRadius:'12px',border:'none',fontSize:'16px'}}>โหลดใหม่</button>
+      </div>;
+    }
+    return this.props.children;
+  }
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<ErrorBoundary><App/></ErrorBoundary>);
 </script>
 </body>
 </html>
