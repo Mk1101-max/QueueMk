@@ -332,20 +332,26 @@ function googleTTS(text,rate){
   });
 }
 
-// เล่นด้วย speechSynthesis (สำรอง)
+// เล่นด้วย speechSynthesis (สำรอง) — คืน Promise(true/false) รอจนพูดจบ
 function browserTTS(text,opts={}){
-  if(!('speechSynthesis' in window)) return false;
-  try{
-    window.speechSynthesis.cancel();
-    const u=new SpeechSynthesisUtterance(text);
-    let v=null;
-    if(opts.voiceName){ v=window.speechSynthesis.getVoices().find(x=>x.name===opts.voiceName); }
-    if(!v) v=pickThaiVoice();
-    if(v) u.voice=v;
-    u.lang='th-TH'; u.rate=opts.rate||0.85; u.pitch=1.0; u.volume=1.0;
-    window.speechSynthesis.speak(u);
-    return true;
-  }catch(e){ return false; }
+  return new Promise((resolve)=>{
+    if(!('speechSynthesis' in window)){ resolve(false); return; }
+    try{
+      window.speechSynthesis.cancel();
+      const u=new SpeechSynthesisUtterance(text);
+      let v=null;
+      if(opts.voiceName){ v=window.speechSynthesis.getVoices().find(x=>x.name===opts.voiceName); }
+      if(!v) v=pickThaiVoice();
+      if(v) u.voice=v;
+      u.lang='th-TH'; u.rate=opts.rate||0.9; u.pitch=1.0; u.volume=1.0;
+      let done=false;
+      u.onend=()=>{ if(!done){done=true; resolve(true);} };
+      u.onerror=()=>{ if(!done){done=true; resolve(false);} };
+      window.speechSynthesis.speak(u);
+      // กันค้าง: ถ้าไม่จบใน 12 วิ ถือว่าจบ
+      setTimeout(()=>{ if(!done){done=true; resolve(true);} }, 12000);
+    }catch(e){ resolve(false); }
+  });
 }
 
 // ฟังก์ชันหลัก: ลอง Google ก่อน ถ้าไม่ได้ใช้ browser
@@ -353,9 +359,9 @@ function browserTTS(text,opts={}){
 async function speakThai(text,opts={}){
   if(!text||!text.trim()) return;
   const engine=opts.engine||'auto';
-  if(engine==='browser'){ browserTTS(text,opts); return; }
+  if(engine==='browser'){ await browserTTS(text,opts); return; }
   const ok=await googleTTS(text,opts.rate);
-  if(!ok && engine!=='google'){ browserTTS(text,opts); }
+  if(!ok && engine!=='google'){ await browserTTS(text,opts); }
 }
 function stopSpeak(){
   _ttsToken++;
@@ -950,18 +956,22 @@ function TVView(){
     duckAndSpeak(speakReq.text);
   },[speakReq,started]);
 
+  const speakingRef = useRef(false);
+  const duckTokenRef = useRef(0);
   const duckAndSpeak=async(text)=>{
     const p=playerRef.current;
-    if(p&&playerReady.current){ try{p.setVolume(8);}catch(e){} }
-    const restore=()=>{ if(p&&playerReady.current){ try{p.setVolume(100);}catch(e){} } };
-    const opts={voiceName,rate,engine};
-    try{
-      await speakThai(text,opts);            // รอบ 1 (รอจบ)
-      await new Promise(r=>setTimeout(r,400));
-      await speakThai(text,opts);            // รอบ 2
-    }catch(e){}
+    const myToken=++duckTokenRef.current;
+    stopSpeak();
     clearTimeout(restoreTimer.current);
-    restoreTimer.current=setTimeout(restore, 800);
+    if(p&&playerReady.current){ try{p.setVolume(10);}catch(e){} }
+    const restore=()=>{ if(myToken===duckTokenRef.current && p&&playerReady.current){ try{p.setVolume(100);}catch(e){} } };
+    speakingRef.current=true;
+    try{
+      await speakThai(text,{voiceName,rate,engine});  // พูดรอบเดียว รอจบจริง
+    }catch(e){}
+    if(myToken!==duckTokenRef.current) return; // มีการเรียกใหม่ทับแล้ว ไม่ต้องคืนเสียง
+    speakingRef.current=false;
+    restoreTimer.current=setTimeout(restore, 500);
   };
 
   const startShow=()=>{
