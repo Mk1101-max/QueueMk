@@ -1,0 +1,1070 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>ระบบคิวรับน้ำมัน</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+<script src="./config.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Thai:wght@400;500;600;700&family=Bai+Jamjuree:wght@600;700&family=JetBrains+Mono:wght@600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --ink:#0c1420; --panel:#101d2e; --panel2:#16273c;
+    --line:#23384f; --sub:#7e98b5; --txt:#e6eef8;
+    --amber:#f5a623; --amber2:#ffc759; --teal:#21d4a8;
+    --red:#ff5d6c; --blue:#4a9eff; --purple:#9d7bff;
+  }
+  *{font-family:'IBM Plex Sans Thai',sans-serif;}
+  body{margin:0;background:var(--ink);color:var(--txt);}
+  .display-font{font-family:'Bai Jamjuree',sans-serif;}
+  .mono{font-family:'JetBrains Mono',monospace;}
+  ::-webkit-scrollbar{width:10px;height:10px;}
+  ::-webkit-scrollbar-track{background:var(--ink);}
+  ::-webkit-scrollbar-thumb{background:var(--line);border-radius:5px;}
+  @keyframes pulse-ring{0%{box-shadow:0 0 0 0 rgba(245,166,35,.5)}70%{box-shadow:0 0 0 16px rgba(245,166,35,0)}100%{box-shadow:0 0 0 0 rgba(245,166,35,0)}}
+  .ring{animation:pulse-ring 1.8s infinite;}
+  @keyframes slideup{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
+  .slideup{animation:slideup .35s ease;}
+  @keyframes blink{0%,100%{opacity:1}50%{opacity:.35}}
+  .blink{animation:blink 1.1s infinite;}
+  .tabbtn{transition:all .15s;}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const {useState,useEffect,useRef,useCallback,createContext,useContext} = React;
+
+/* ---------- Shared store via BroadcastChannel + in-memory ---------- */
+const CH = new BroadcastChannel('queue-system');
+const Store = createContext(null);
+
+const DEFAULT_STATUSES = [
+  'รอออกตั๋ว','รับตั๋ว','รอลูกค้าโอนเงิน','รอเงินเข้าระบบ','รับ E20',
+  'นำ Shipment ไปเติมก่อน','รอราคา E20','รอวัดถัง','รอออเดอร์','รอตรวจสอบ',
+  'โหลดตั้ง','รอเซ็ตรถ/พขร.','พักทานข้าว','รออนุมัติราคาตั๋ว2','รอราคาตั๋ว2',
+  'รออนุมัติเครดิต','รอเคลียร์น้ำมัน','รองาน','นำใบสั่งซื้อไปเติมก่อน','รอบัญชีตัดเงิน',
+  'รอสต๊อคน้ำมัน','รอน้ำมัน','รอโอนเงินเพิ่ม','รอเคลียร์เอกสาร',
+  'กำลังเรียก','ข้ามคิว'
+];
+const FIRST_STATUS = DEFAULT_STATUSES[0]; // 'รอออกตั๋ว'
+
+function genId(){return Date.now().toString(36)+Math.random().toString(36).slice(2,6);}
+
+// ดึง YouTube video id จาก url หรือ id ตรงๆ
+function extractYtId(input){
+  if(!input) return null;
+  const s=input.trim();
+  const m=s.match(/(?:v=|youtu\.be\/|embed\/|shorts\/)([\w-]{11})/);
+  if(m) return m[1];
+  if(/^[\w-]{11}$/.test(s)) return s;
+  return null;
+}
+
+// ดึงวันที่จากชื่อไฟล์ เช่น PTC_21_06_2026 / PTC-21-06-2026 / 21_06_2026 → 'YYYY-MM-DD'
+function parseFileDate(name){
+  const m=name.match(/(\d{1,2})[_\-.](\d{1,2})[_\-.](\d{2,4})/);
+  if(!m) return null;
+  let [_,d,mo,y]=m;
+  d=+d; mo=+mo; y=+y;
+  if(y<100) y+=2000;
+  if(d>31||mo>12||d<1||mo<1) return null;
+  const pad=n=>String(n).padStart(2,'0');
+  return `${y}-${pad(mo)}-${pad(d)}`;
+}
+
+/* ===================== DATA LAYER (Supabase หรือ local) ===================== */
+const CFG = window.APP_CONFIG || {};
+const HAS_SUPABASE = !!(CFG.SUPABASE_URL && CFG.SUPABASE_ANON_KEY);
+let sb = null;
+if(HAS_SUPABASE && window.supabase){
+  try{ sb = window.supabase.createClient(CFG.SUPABASE_URL, CFG.SUPABASE_ANON_KEY); }catch(e){ console.error('Supabase init error',e); }
+}
+// แปลง ticket object <-> แถวในฐานข้อมูล (snake_case)
+const ticketToRow = (t)=>({id:t.id,type:t.type,no:t.no,name:t.name,car_no:t.carNo,station:t.station,depot:t.depot,trip:t.trip,company:t.company,phone:t.phone,plate:t.plate,note:t.note,product:t.product,volume:t.volume,items:t.items||null,status:t.status,created_at:t.createdAt});
+const rowToTicket = (r)=>({id:r.id,type:r.type,no:r.no,name:r.name,carNo:r.car_no,station:r.station,depot:r.depot,trip:r.trip,company:r.company,phone:r.phone,plate:r.plate,note:r.note,product:r.product,volume:r.volume,items:r.items,status:r.status,createdAt:r.created_at});
+const tripToRow = (t)=>({id:t.id,car_no:t.carNo,station:t.station,depot:t.depot,trip:t.trip,sheet:t.sheet});
+const rowToTrip = (r)=>({id:r.id,carNo:r.car_no,station:r.station,depot:r.depot,trip:r.trip,sheet:r.sheet});
+
+function StoreProvider({children}){
+  const [tickets,setTickets] = useState([]);
+  const [trips,setTrips] = useState([]);
+  const [calling,setCalling] = useState(null);
+  const [history,setHistory] = useState({});
+  const [speakReq,setSpeakReq] = useState(null);
+  const [statuses,setStatuses] = useState(DEFAULT_STATUSES);
+  const [playlist,setPlaylist] = useState([]);
+  const [playMode,setPlayMode] = useState('order');
+
+  const broadcast = (type,payload)=>{ if(!HAS_SUPABASE) CH.postMessage({type,payload}); };
+  const stateRef = useRef({});
+  useEffect(()=>{stateRef.current={tickets,trips,calling,history,statuses,playlist,playMode};},[tickets,trips,calling,history,statuses,playlist,playMode]);
+
+  /* ---------- โหมด Supabase: โหลด + realtime ---------- */
+  useEffect(()=>{
+    if(!HAS_SUPABASE || !sb) return;
+    let active=true;
+    const loadAll=async()=>{
+      const [tk,tp,st,pl,hi,ap] = await Promise.all([
+        sb.from('tickets').select('*'),
+        sb.from('trips').select('*'),
+        sb.from('statuses').select('*').order('ord'),
+        sb.from('playlist').select('*').order('ord'),
+        sb.from('history').select('*'),
+        sb.from('app_state').select('*'),
+      ]);
+      if(!active) return;
+      if(tk.data) setTickets(tk.data.map(rowToTicket));
+      if(tp.data) setTrips(tp.data.map(rowToTrip));
+      if(st.data){ const extra=st.data.map(r=>r.name).filter(n=>!DEFAULT_STATUSES.includes(n));
+        const idx=DEFAULT_STATUSES.indexOf('กำลังเรียก');
+        setStatuses([...DEFAULT_STATUSES.slice(0,idx),...extra,...DEFAULT_STATUSES.slice(idx)]); }
+      if(pl.data) setPlaylist(pl.data.map(r=>({id:r.id,url:r.url,vid:r.vid})));
+      if(hi.data){ const h={}; hi.data.forEach(r=>{ (h[r.station]=h[r.station]||[]).push(r.date); }); Object.keys(h).forEach(k=>h[k].sort()); setHistory(h); }
+      if(ap.data){ ap.data.forEach(r=>{ if(r.key==='playMode') setPlayMode(r.value); if(r.key==='calling') setCalling(r.value); }); }
+    };
+    loadAll();
+    const reloadTickets=async()=>{ const {data}=await sb.from('tickets').select('*'); if(active&&data) setTickets(data.map(rowToTicket)); };
+    const reloadTrips=async()=>{ const {data}=await sb.from('trips').select('*'); if(active&&data) setTrips(data.map(rowToTrip)); };
+    // realtime: ทุกตารางเปลี่ยน → โหลดใหม่ (ง่ายและชัวร์สำหรับขนาดข้อมูลนี้)
+    const ch = sb.channel('queue-realtime')
+      .on('postgres_changes',{event:'*',schema:'public',table:'tickets'},()=>reloadTickets())
+      .on('postgres_changes',{event:'*',schema:'public',table:'trips'},()=>reloadTrips())
+      .on('postgres_changes',{event:'*',schema:'public',table:'statuses'},loadAll)
+      .on('postgres_changes',{event:'*',schema:'public',table:'playlist'},loadAll)
+      .on('postgres_changes',{event:'*',schema:'public',table:'history'},loadAll)
+      .on('postgres_changes',{event:'*',schema:'public',table:'app_state'},(p)=>{
+        const r=p.new||{}; if(r.key==='playMode') setPlayMode(r.value); if(r.key==='calling') setCalling(r.value);
+        if(r.key==='speak') setSpeakReq(r.value);
+      })
+      .subscribe();
+    return ()=>{ active=false; sb.removeChannel(ch); };
+  },[]);
+
+  /* ---------- โหมด local (ไม่มี Supabase): BroadcastChannel เดิม ---------- */
+  useEffect(()=>{
+    if(HAS_SUPABASE) return;
+    CH.onmessage = (e)=>{
+      const {type,payload} = e.data;
+      if(type==='sync-request'){ broadcast('sync-state',stateRef.current); CH.postMessage({type:'sync-state',payload:stateRef.current}); }
+      if(type==='sync-state'){ setTickets(payload.tickets); setTrips(payload.trips); setCalling(payload.calling); if(payload.history)setHistory(payload.history); if(payload.statuses)setStatuses(payload.statuses); if(payload.playlist)setPlaylist(payload.playlist); if(payload.playMode)setPlayMode(payload.playMode); }
+      if(type==='add'){ setTickets(t=> t.some(x=>x.id===payload.id)?t:[...t,payload]); }
+      if(type==='update'){ setTickets(t=>t.map(x=>x.id===payload.id?{...x,...payload.patch}:x)); }
+      if(type==='remove'){ setTickets(t=>t.filter(x=>x.id!==payload.id)); }
+      if(type==='trips'){ setTrips(payload); }
+      if(type==='trip-update'){ setTrips(t=>t.map(x=>x.id===payload.id?{...x,...payload.patch}:x)); }
+      if(type==='history'){ setHistory(payload); }
+      if(type==='statuses'){ setStatuses(payload); }
+      if(type==='playlist'){ setPlaylist(payload); }
+      if(type==='playmode'){ setPlayMode(payload); }
+      if(type==='speak'){ setSpeakReq(payload); }
+      if(type==='calling'){ setCalling(payload); }
+    };
+    CH.postMessage({type:'sync-request',payload:{}});
+    return ()=>{CH.onmessage=null;};
+  },[]);
+
+  /* ---------- Actions (เขียน Supabase ถ้ามี ไม่งั้น local) ---------- */
+  const addTicket = (t)=>{
+    const seq = tickets.filter(x=>x.type===t.type).length+1;
+    const tk={...t,id:genId(),no:seq,createdAt:Date.now(),status:FIRST_STATUS};
+    if(HAS_SUPABASE){ sb.from('tickets').insert(ticketToRow(tk)).then(({error})=>{if(error)console.error(error);}); }
+    else { setTickets(prev=>[...prev,tk]); broadcast('add',tk); }
+    return tk;
+  };
+  const updateTicket = (id,patch)=>{
+    if(HAS_SUPABASE){ const row={}; if('status' in patch)row.status=patch.status; sb.from('tickets').update(row).eq('id',id).then(({error})=>{if(error)console.error(error);}); }
+    else { setTickets(t=>t.map(x=>x.id===id?{...x,...patch}:x)); broadcast('update',{id,patch}); }
+  };
+  const removeTicket = (id)=>{
+    if(HAS_SUPABASE){
+      sb.from('tickets').delete().eq('id',id).then(({error})=>{if(error)console.error(error);});
+      if(calling===id) setCall(null);
+    } else {
+      setTickets(t=>t.filter(x=>x.id!==id));
+      setCalling(c=>{ if(c===id){broadcast('calling',null); return null;} return c; });
+      broadcast('remove',{id});
+    }
+  };
+  const setTripsAll = (rows)=>{
+    if(HAS_SUPABASE){
+      (async()=>{ await sb.from('trips').delete().neq('id',''); if(rows.length) await sb.from('trips').insert(rows.map(tripToRow)); })();
+    } else { setTrips(rows); broadcast('trips',rows); }
+  };
+  const updateTrip = (id,patch)=>{
+    if(HAS_SUPABASE){ const row={}; if('carNo' in patch)row.car_no=patch.carNo; sb.from('trips').update(row).eq('id',id).then(({error})=>{if(error)console.error(error);}); }
+    else { setTrips(t=>t.map(x=>x.id===id?{...x,...patch}:x)); broadcast('trip-update',{id,patch}); }
+  };
+  const addHistory = (stations,dateStr)=>{
+    if(HAS_SUPABASE){
+      const rows=stations.map(st=>({station:st,date:dateStr}));
+      sb.from('history').upsert(rows,{onConflict:'station,date'}).then(({error})=>{if(error)console.error(error);});
+    } else {
+      setHistory(prev=>{
+        const cutoff=new Date(); cutoff.setMonth(cutoff.getMonth()-2);
+        const cut=cutoff.toISOString().slice(0,10);
+        const next={...prev};
+        stations.forEach(st=>{ const arr=new Set(next[st]||[]); arr.add(dateStr); next[st]=[...arr].filter(d=>d>=cut).sort(); });
+        broadcast('history',next); return next;
+      });
+    }
+  };
+  const setHistoryAll = (h)=>{
+    if(HAS_SUPABASE){
+      const rows=[]; Object.entries(h).forEach(([st,dates])=>dates.forEach(d=>rows.push({station:st,date:d})));
+      sb.from('history').upsert(rows,{onConflict:'station,date'}).then(({error})=>{if(error)console.error(error);});
+    } else { setHistory(h); broadcast('history',h); }
+  };
+  const setCall = (id)=>{
+    if(HAS_SUPABASE){ sb.from('app_state').upsert({key:'calling',value:id}).then(({error})=>{if(error)console.error(error);}); setCalling(id); }
+    else { setCalling(id); broadcast('calling',id); }
+  };
+  const requestSpeak = (text)=>{
+    const req={id:genId(),text};
+    if(HAS_SUPABASE){ sb.from('app_state').upsert({key:'speak',value:req}).then(({error})=>{if(error)console.error(error);}); }
+    else { setSpeakReq(req); broadcast('speak',req); }
+  };
+  const addStatus = (name)=>{
+    const s=name.trim(); if(!s) return false;
+    if(statuses.includes(s)) return false;
+    if(HAS_SUPABASE){ sb.from('statuses').insert({name:s,ord:Date.now()}).then(({error})=>{if(error)console.error(error);}); return true; }
+    setStatuses(prev=>{ if(prev.includes(s)) return prev; const idx=prev.indexOf('กำลังเรียก'); const next=idx>=0?[...prev.slice(0,idx),s,...prev.slice(idx)]:[...prev,s]; broadcast('statuses',next); return next; });
+    return true;
+  };
+  const setPlaylistAll = (list)=>{ if(!HAS_SUPABASE){ setPlaylist(list); broadcast('playlist',list); } };
+  const addVideo = (url)=>{
+    const vid=extractYtId(url);
+    if(!vid) return {ok:false,msg:'ลิงก์ YouTube ไม่ถูกต้อง'};
+    if(playlist.length>=30) return {ok:false,msg:'ใส่ได้สูงสุด 30 คลิป'};
+    if(playlist.some(p=>p.vid===vid)) return {ok:false,msg:'มีคลิปนี้อยู่แล้ว'};
+    const item={id:genId(),url,vid};
+    if(HAS_SUPABASE){ sb.from('playlist').insert({...item,ord:playlist.length}).then(({error})=>{if(error)console.error(error);}); }
+    else { setPlaylist(prev=>{ const next=[...prev,item]; broadcast('playlist',next); return next; }); }
+    return {ok:true};
+  };
+  const removeVideo = (id)=>{
+    if(HAS_SUPABASE){ sb.from('playlist').delete().eq('id',id).then(({error})=>{if(error)console.error(error);}); }
+    else { setPlaylist(prev=>{ const next=prev.filter(p=>p.id!==id); broadcast('playlist',next); return next; }); }
+  };
+  const setMode = (m)=>{
+    if(HAS_SUPABASE){ sb.from('app_state').upsert({key:'playMode',value:m}).then(({error})=>{if(error)console.error(error);}); setPlayMode(m); }
+    else { setPlayMode(m); broadcast('playmode',m); }
+  };
+
+  return <Store.Provider value={{tickets,trips,calling,history,speakReq,statuses,playlist,playMode,addTicket,updateTicket,removeTicket,setTripsAll,updateTrip,addHistory,setHistoryAll,setCall,requestSpeak,addStatus,addVideo,removeVideo,setMode,setPlaylistAll}}>{children}</Store.Provider>;
+}
+
+/* ---------- Thai TTS ---------- */
+function getThaiVoices(){
+  const voices = window.speechSynthesis.getVoices();
+  return voices.filter(v=>(v.lang||'').toLowerCase().startsWith('th'));
+}
+function pickThaiVoice(){
+  const th = getThaiVoices();
+  if(th.length===0) return null;
+  const pref = th.find(v=>/google|premium|natural|enhanced|online/i.test(v.name));
+  return pref || th[0];
+}
+// opts: {voiceName, rate}
+function speakThai(text,opts={}){
+  if(!('speechSynthesis' in window)) return;
+  window.speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text);
+  let v=null;
+  if(opts.voiceName){ v=window.speechSynthesis.getVoices().find(x=>x.name===opts.voiceName); }
+  if(!v) v=pickThaiVoice();
+  if(v) u.voice = v;
+  u.lang='th-TH';
+  u.rate=opts.rate||0.85;
+  u.pitch=1.0;
+  u.volume=1.0;
+  window.speechSynthesis.speak(u);
+}
+// แปลงเบอร์รถให้อ่านชัด: แยกตัวเลขทีละหลัก เว้นวรรค เช่น "212" → "2 1 2"
+function spellCarNo(carNo){
+  // ตัดส่วนหลังขีด (ชื่อคนขับ) ออก เอาเฉพาะเลขรถ
+  const main = String(carNo).split('-')[0].trim();
+  // ถ้าเป็นตัวเลขล้วน อ่านทีละหลัก
+  if(/^\d+$/.test(main)) return main.split('').join(' ');
+  return main;
+}
+
+/* ---------- Small UI bits ---------- */
+function StatusBadge({s}){
+  const special={'กำลังเรียก':'var(--amber)','ข้ามคิว':'var(--red)','รับตั๋ว':'var(--teal)','รับ E20':'var(--teal)','พักทานข้าว':'var(--purple)'};
+  let c=special[s];
+  if(!c){
+    if(/^รอ/.test(s)) c='var(--sub)';        // สถานะ "รอ..." = เทา
+    else if(/^นำ/.test(s)) c='var(--blue)';  // สถานะ "นำ..." = ฟ้า
+    else c='var(--blue)';
+  }
+  return <span style={{color:c,borderColor:c}} className="text-xs font-semibold px-2.5 py-1 rounded-full border bg-black/20 whitespace-nowrap">{s}</span>;
+}
+function Field({label,children}){
+  return <label className="block"><span className="text-sm font-medium text-[var(--sub)] mb-1.5 block">{label}</span>{children}</label>;
+}
+const inputCls="w-full bg-[var(--ink)] border border-[var(--line)] rounded-xl px-4 py-3 text-[var(--txt)] outline-none focus:border-[var(--amber)] transition";
+
+/* ===================== CUSTOMER ===================== */
+function CustomerView(){
+  const {addTicket,trips} = useContext(Store);
+  const [mode,setMode] = useState(null); // 'in'|'out'
+  const [done,setDone] = useState(null);
+
+  if(done){
+    return <div className="max-w-xl mx-auto mt-10 slideup">
+      <div className="bg-[var(--panel)] border border-[var(--line)] rounded-3xl p-10 text-center">
+        <div className="text-[var(--teal)] text-5xl mb-3">✓</div>
+        <h2 className="display-font text-2xl font-bold mb-1">รับคิวเรียบร้อย</h2>
+        <p className="text-[var(--sub)] mb-6">กรุณารอเรียกคิวที่หน้าจอแสดงผล</p>
+        <div className="bg-[var(--ink)] rounded-2xl py-6 mb-6 border border-[var(--line)]">
+          <div className="text-sm text-[var(--sub)]">หมายเลขคิว</div>
+          <div className="display-font text-6xl font-bold text-[var(--amber)] mono">{done.type==='in'?'A':'B'}{String(done.no).padStart(3,'0')}</div>
+          <div className="mt-2 text-[var(--txt)]">{done.name}{done.type==='out'&&done.company?' · '+done.company:''}</div>
+          {done.station && done.type==='in' && <div className="mt-1 text-[var(--blue)] text-sm">สถานี: {done.station}</div>}
+        </div>
+        <button onClick={()=>{setDone(null);setMode(null);}} className="w-full bg-[var(--amber)] text-black font-bold py-3 rounded-xl hover:bg-[var(--amber2)] transition">รับคิวใหม่</button>
+      </div>
+    </div>;
+  }
+
+  if(!mode){
+    return <div className="max-w-2xl mx-auto mt-10">
+      <h1 className="display-font text-3xl font-bold text-center mb-2">รับคิวรับน้ำมัน</h1>
+      <p className="text-center text-[var(--sub)] mb-8">เลือกประเภทลูกค้าเพื่อกรอกข้อมูล</p>
+      <div className="grid md:grid-cols-2 gap-5">
+        <button onClick={()=>setMode('in')} className="group bg-[var(--panel)] hover:bg-[var(--panel2)] border border-[var(--line)] hover:border-[var(--amber)] rounded-3xl p-8 text-left transition">
+          <div className="text-4xl mb-3">🚛</div>
+          <div className="display-font text-xl font-bold mb-1">ลูกค้าภายใน</div>
+          <p className="text-sm text-[var(--sub)]">กรอกเบอร์รถ ระบบจะแมชเที่ยวรถและสถานีให้อัตโนมัติ</p>
+        </button>
+        <button onClick={()=>setMode('out')} className="group bg-[var(--panel)] hover:bg-[var(--panel2)] border border-[var(--line)] hover:border-[var(--amber)] rounded-3xl p-8 text-left transition">
+          <div className="text-4xl mb-3">🏭</div>
+          <div className="display-font text-xl font-bold mb-1">ลูกค้าภายนอก</div>
+          <p className="text-sm text-[var(--sub)]">กรอกรายการรับน้ำมันด้วยตนเอง</p>
+        </button>
+      </div>
+    </div>;
+  }
+  return mode==='in'
+    ? <InternalForm trips={trips} onBack={()=>setMode(null)} onSubmit={(d)=>setDone(addTicket(d))} />
+    : <ExternalForm onBack={()=>setMode(null)} onSubmit={(d)=>setDone(addTicket(d))} />;
+}
+
+function InternalForm({trips,onBack,onSubmit}){
+  const [carNo,setCarNo] = useState('');
+  const [name,setName] = useState('');
+  const [matched,setMatched] = useState(null);
+  const [err,setErr] = useState('');
+
+  useEffect(()=>{
+    if(!carNo){setMatched(null);return;}
+    const q=carNo.trim().toLowerCase();
+    const head=s=>String(s).trim().toLowerCase().split('-')[0].trim();
+    const m = trips.find(t=>{
+      const c=String(t.carNo).trim().toLowerCase();
+      if(!c) return false;
+      return c===q || head(c)===q || head(c)===head(q);
+    });
+    setMatched(m||null);
+  },[carNo,trips]);
+
+  const submit=()=>{
+    if(!carNo||!name){setErr('กรุณากรอกเบอร์รถและชื่อ');return;}
+    onSubmit({type:'in',carNo,name,station:matched?.station||'',depot:matched?.depot||'',trip:matched?.trip||''});
+  };
+
+  return <div className="max-w-xl mx-auto mt-8 slideup">
+    <button onClick={onBack} className="text-[var(--sub)] hover:text-[var(--txt)] mb-4 text-sm">← กลับ</button>
+    <div className="bg-[var(--panel)] border border-[var(--line)] rounded-3xl p-7">
+      <h2 className="display-font text-xl font-bold mb-5">ลูกค้าภายใน · กรอกเบอร์รถ</h2>
+      <div className="space-y-4">
+        <Field label="เบอร์รถ"><input className={inputCls} value={carNo} onChange={e=>setCarNo(e.target.value)} placeholder="เช่น 70-1234" /></Field>
+        {carNo && (matched
+          ? <div className="bg-[var(--ink)] border border-[var(--teal)]/40 rounded-xl p-4 text-sm">
+              <div className="text-[var(--teal)] font-semibold mb-1">✓ พบเที่ยวรถ</div>
+              <div className="space-y-1 text-[var(--sub)]">
+                <div>สถานี: <span className="text-[var(--txt)]">{matched.station||'-'}</span></div>
+                {matched.depot && <div>คลังที่รับ: <span className="text-[var(--txt)]">{matched.depot}</span></div>}
+                {matched.trip && <div>เที่ยว: <span className="text-[var(--txt)]">{matched.trip}</span></div>}
+              </div>
+            </div>
+          : <div className="bg-[var(--ink)] border border-[var(--red)]/40 rounded-xl p-3 text-sm text-[var(--red)]">ไม่พบเบอร์รถนี้ในไฟล์ — รับคิวได้ สถานีจะเว้นว่างไว้</div>)}
+        <Field label="ชื่อผู้ขับ / ผู้ติดต่อ"><input className={inputCls} value={name} onChange={e=>setName(e.target.value)} placeholder="ชื่อ-นามสกุล" /></Field>
+        {err && <div className="text-[var(--red)] text-sm">{err}</div>}
+        <button onClick={submit} className="w-full bg-[var(--amber)] text-black font-bold py-3 rounded-xl hover:bg-[var(--amber2)] transition">รับคิว</button>
+      </div>
+    </div>
+  </div>;
+}
+
+function ExternalForm({onBack,onSubmit}){
+  const [f,setF] = useState({name:'',company:'',phone:'',plate:'',note:''});
+  const [items,setItems] = useState(Array.from({length:6},()=>({product:'',volume:''})));
+  const [err,setErr] = useState('');
+  const set=(k,v)=>setF(p=>({...p,[k]:v}));
+  const setItem=(i,k,v)=>setItems(prev=>prev.map((it,idx)=>idx===i?{...it,[k]:v}:it));
+  const submit=()=>{
+    if(!f.name||!f.company){setErr('กรุณากรอกชื่อและบริษัท');return;}
+    const filled = items.filter(it=>it.product||it.volume);
+    onSubmit({type:'out',...f,items:filled,
+      product:filled[0]?.product||'', volume:filled[0]?.volume||'', station:'-'});
+  };
+  return <div className="max-w-xl mx-auto mt-8 slideup">
+    <button onClick={onBack} className="text-[var(--sub)] hover:text-[var(--txt)] mb-4 text-sm">← กลับ</button>
+    <div className="bg-[var(--panel)] border border-[var(--line)] rounded-3xl p-7">
+      <h2 className="display-font text-xl font-bold mb-5">ลูกค้าภายนอก · รายการรับน้ำมัน</h2>
+      <div className="space-y-4">
+        <div className="grid grid-cols-2 gap-4">
+          <Field label="ชื่อผู้ติดต่อ"><input className={inputCls} value={f.name} onChange={e=>set('name',e.target.value)} /></Field>
+          <Field label="เบอร์โทร"><input className={inputCls} value={f.phone} onChange={e=>set('phone',e.target.value)} /></Field>
+        </div>
+        <Field label="บริษัท"><input className={inputCls} value={f.company} onChange={e=>set('company',e.target.value)} /></Field>
+        <div>
+          <span className="text-sm font-medium text-[var(--sub)] mb-1.5 block">รายการรับน้ำมัน (ไม่บังคับ กรอกเท่าที่ต้องการ)</span>
+          <div className="space-y-2">
+            {items.map((it,i)=>(
+              <div key={i} className="grid grid-cols-2 gap-2">
+                <select className={inputCls+' py-2.5'} value={it.product} onChange={e=>setItem(i,'product',e.target.value)}>
+                  <option value="">— ชนิดน้ำมัน {i+1} —</option>
+                  {['ดีเซล','เบนซิน 95','แก๊สโซฮอล์ 91','แก๊สโซฮอล์ 95','แก๊สโซฮอล์ E20','น้ำมันเตา'].map(o=><option key={o}>{o}</option>)}
+                </select>
+                <input className={inputCls+' py-2.5'} value={it.volume} onChange={e=>setItem(i,'volume',e.target.value)} placeholder="ปริมาณ (ลิตร)" />
+              </div>
+            ))}
+          </div>
+        </div>
+        <Field label="ทะเบียนรถ"><input className={inputCls} value={f.plate} onChange={e=>set('plate',e.target.value)} /></Field>
+        <Field label="หมายเหตุ"><input className={inputCls} value={f.note} onChange={e=>set('note',e.target.value)} /></Field>
+        {err && <div className="text-[var(--red)] text-sm">{err}</div>}
+        <button onClick={submit} className="w-full bg-[var(--amber)] text-black font-bold py-3 rounded-xl hover:bg-[var(--amber2)] transition">รับคิว</button>
+      </div>
+    </div>
+  </div>;
+}
+
+/* ===================== ADMIN ===================== */
+function StatsTable({history}){
+  const [q,setQ] = useState('');
+  const [sort,setSort] = useState('rounds'); // rounds | avg | name
+  // คำนวณสถิติต่อสถานี
+  const rows = Object.entries(history).map(([station,dates])=>{
+    const ds=[...dates].sort();
+    const rounds=ds.length;
+    // ช่วงห่างระหว่างแต่ละครั้ง (วัน)
+    let avgGap=null, lastGap=null;
+    if(rounds>=2){
+      const gaps=[];
+      for(let i=1;i<ds.length;i++){
+        const diff=(new Date(ds[i])-new Date(ds[i-1]))/(1000*60*60*24);
+        gaps.push(diff);
+      }
+      avgGap=gaps.reduce((a,b)=>a+b,0)/gaps.length;
+      lastGap=gaps[gaps.length-1];
+    }
+    return {station,rounds,avgGap,lastGap,first:ds[0],last:ds[ds.length-1]};
+  });
+  const filtered=rows.filter(r=>!q||r.station.toLowerCase().includes(q.toLowerCase()));
+  filtered.sort((a,b)=>{
+    if(sort==='name') return a.station.localeCompare(b.station,'th');
+    if(sort==='avg') return (b.avgGap??-1)-(a.avgGap??-1);
+    return b.rounds-a.rounds;
+  });
+
+  if(Object.keys(history).length===0) return <div className="bg-[var(--panel)] border border-[var(--line)] rounded-2xl p-10 text-center text-[var(--sub)]">ยังไม่มีประวัติ — อัปโหลดไฟล์เที่ยวรถ (ชื่อไฟล์ต้องมีวันที่ เช่น PTC_21_06_2026) อย่างน้อย 2 วันที่ต่างกัน เพื่อให้คำนวณวันต่อรอบได้</div>;
+
+  return <div>
+    <div className="bg-[var(--panel)] border border-[var(--line)] rounded-2xl p-4 mb-4 text-sm text-[var(--sub)]">
+      สถิติคำนวณจากวันที่ของไฟล์ที่อัปโหลด (ย้อนหลัง 2 เดือน) · <span className="text-[var(--txt)]">รอบ</span> = จำนวนครั้งที่สถานีปรากฏในไฟล์ · <span className="text-[var(--txt)]">เฉลี่ยวัน/รอบ</span> = ระยะห่างเฉลี่ยระหว่างแต่ละครั้ง (ต้องมีอย่างน้อย 2 ครั้ง)
+    </div>
+    <div className="bg-[var(--panel)] border border-[var(--line)] rounded-2xl overflow-hidden">
+      <div className="p-3 border-b border-[var(--line)] flex gap-2 flex-wrap">
+        <input value={q} onChange={e=>setQ(e.target.value)} placeholder="ค้นหาสถานี..." className="flex-1 min-w-[200px] bg-[var(--ink)] border border-[var(--line)] rounded-xl px-4 py-2.5 text-sm outline-none focus:border-[var(--amber)]" />
+        <select value={sort} onChange={e=>setSort(e.target.value)} className="bg-[var(--ink)] border border-[var(--line)] rounded-xl px-3 py-2.5 text-sm outline-none focus:border-[var(--amber)]">
+          <option value="rounds">เรียงตามจำนวนรอบ</option>
+          <option value="avg">เรียงตามเฉลี่ยวัน/รอบ</option>
+          <option value="name">เรียงตามชื่อสถานี</option>
+        </select>
+      </div>
+      <div className="overflow-x-auto max-h-[560px] overflow-y-auto">
+      <table className="w-full text-sm">
+        <thead className="sticky top-0"><tr className="bg-[var(--ink)] text-[var(--sub)] text-left">
+          <th className="px-4 py-3 font-medium w-12">#</th>
+          <th className="px-4 py-3 font-medium">สถานี</th>
+          <th className="px-4 py-3 font-medium text-center">จำนวนรอบ</th>
+          <th className="px-4 py-3 font-medium text-center">เฉลี่ยวัน/รอบ</th>
+          <th className="px-4 py-3 font-medium text-center">รอบล่าสุด</th>
+          <th className="px-4 py-3 font-medium">ช่วงวันที่</th>
+        </tr></thead>
+        <tbody>
+          {filtered.length===0 && <tr><td colSpan="6" className="px-4 py-8 text-center text-[var(--sub)]">ไม่พบสถานี</td></tr>}
+          {filtered.map((r,i)=>(
+            <tr key={r.station} className="border-t border-[var(--line)]">
+              <td className="px-4 py-2.5 text-[var(--sub)] mono">{i+1}</td>
+              <td className="px-4 py-2.5">{r.station}</td>
+              <td className="px-4 py-2.5 text-center"><span className="mono font-bold text-[var(--amber)]">{r.rounds}</span></td>
+              <td className="px-4 py-2.5 text-center">{r.avgGap!=null?<span className="mono font-bold text-[var(--teal)]">{r.avgGap.toFixed(1)} วัน</span>:<span className="text-[var(--sub)]">—</span>}</td>
+              <td className="px-4 py-2.5 text-center text-[var(--sub)]">{r.lastGap!=null?r.lastGap+' วัน':'—'}</td>
+              <td className="px-4 py-2.5 text-[var(--sub)] text-xs">{r.first} → {r.last}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      </div>
+    </div>
+  </div>;
+}
+
+function TripsTable({trips,updateTrip}){
+  const [q,setQ] = useState('');
+  const [sheetFilter,setSheetFilter] = useState('all');
+  const sheets = [...new Set(trips.map(t=>t.sheet).filter(Boolean))];
+  const filtered = trips.filter(t=>{
+    if(sheetFilter!=='all' && t.sheet!==sheetFilter) return false;
+    if(q) return (t.station+' '+t.carNo+' '+t.depot+' '+(t.sheet||'')).toLowerCase().includes(q.toLowerCase());
+    return true;
+  });
+  if(trips.length===0) return <div className="bg-[var(--panel)] border border-[var(--line)] rounded-2xl p-10 text-center text-[var(--sub)]">ยังไม่มีข้อมูลเที่ยวรถ — อัปโหลดไฟล์ด้านบนก่อน</div>;
+  return <div className="bg-[var(--panel)] border border-[var(--line)] rounded-2xl overflow-hidden">
+    <div className="p-3 border-b border-[var(--line)] flex gap-2 flex-wrap">
+      <input value={q} onChange={e=>setQ(e.target.value)} placeholder="ค้นหา สถานี / เบอร์รถ / คลัง / แท็บ..." className="flex-1 min-w-[200px] bg-[var(--ink)] border border-[var(--line)] rounded-xl px-4 py-2.5 text-sm outline-none focus:border-[var(--amber)]" />
+      {sheets.length>1 && <select value={sheetFilter} onChange={e=>setSheetFilter(e.target.value)} className="bg-[var(--ink)] border border-[var(--line)] rounded-xl px-3 py-2.5 text-sm outline-none focus:border-[var(--amber)]">
+        <option value="all">ทุกแท็บ</option>
+        {sheets.map(s=><option key={s} value={s}>{s}</option>)}
+      </select>}
+    </div>
+    <div className="overflow-x-auto max-h-[560px] overflow-y-auto">
+    <table className="w-full text-sm">
+      <thead className="sticky top-0"><tr className="bg-[var(--ink)] text-[var(--sub)] text-left">
+        <th className="px-4 py-3 font-medium w-12">#</th>
+        <th className="px-4 py-3 font-medium">แท็บ</th>
+        <th className="px-4 py-3 font-medium">สถานี (คอลัมน์ B)</th>
+        <th className="px-4 py-3 font-medium">คลังที่รับ</th>
+        <th className="px-4 py-3 font-medium">เที่ยว</th>
+        <th className="px-4 py-3 font-medium w-48">เบอร์รถ (แก้ได้)</th>
+      </tr></thead>
+      <tbody>
+        {filtered.length===0 && <tr><td colSpan="6" className="px-4 py-8 text-center text-[var(--sub)]">ไม่พบรายการ</td></tr>}
+        {filtered.map((t,i)=>(
+          <tr key={t.id} className={`border-t border-[var(--line)] ${t.carNo?'':'bg-[var(--amber)]/[0.03]'}`}>
+            <td className="px-4 py-2 text-[var(--sub)] mono">{i+1}</td>
+            <td className="px-4 py-2"><span className="text-xs px-2 py-0.5 rounded-full bg-[var(--blue)]/15 text-[var(--blue)] whitespace-nowrap">{t.sheet||'-'}</span></td>
+            <td className="px-4 py-2">{t.station}</td>
+            <td className="px-4 py-2 text-[var(--sub)]">{t.depot||'-'}</td>
+            <td className="px-4 py-2 text-[var(--sub)]">{t.trip||'-'}</td>
+            <td className="px-4 py-2">
+              <input value={t.carNo} onChange={e=>updateTrip(t.id,{carNo:e.target.value})}
+                placeholder="ใส่เบอร์รถ"
+                className={`w-full bg-[var(--ink)] border rounded-lg px-3 py-1.5 text-sm mono outline-none focus:border-[var(--amber)] ${t.carNo?'border-[var(--line)] text-[var(--amber)]':'border-[var(--amber)]/30 text-[var(--txt)]'}`} />
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+    </div>
+    <div className="px-4 py-2.5 border-t border-[var(--line)] text-xs text-[var(--sub)]">
+      มีเบอร์รถแล้ว {trips.filter(t=>t.carNo).length} / {trips.length} แถว · พิมพ์ในช่องเบอร์รถเพื่อแก้ไขได้ทันที (บันทึกอัตโนมัติ)
+    </div>
+  </div>;
+}
+
+function VideoManager({playlist,playMode,addVideo,removeVideo,setMode}){
+  const [url,setUrl] = useState('');
+  const submit=()=>{ if(!url.trim())return; const r=addVideo(url); if(r.ok){setUrl('');} else {alert(r.msg);} };
+  return <div className="space-y-4">
+    <div className="bg-[var(--panel)] border border-[var(--line)] rounded-2xl p-4">
+      <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+        <h3 className="font-bold display-font">เพลย์ลิสต์วิดีโอ ({playlist.length}/30)</h3>
+        <div className="flex gap-2">
+          <button onClick={()=>setMode('order')} className={`px-4 py-2 rounded-xl text-sm font-semibold ${playMode==='order'?'bg-[var(--amber)] text-black':'bg-[var(--ink)] border border-[var(--line)]'}`}>▶ เล่นตามลำดับ</button>
+          <button onClick={()=>setMode('shuffle')} className={`px-4 py-2 rounded-xl text-sm font-semibold ${playMode==='shuffle'?'bg-[var(--amber)] text-black':'bg-[var(--ink)] border border-[var(--line)]'}`}>🔀 สุ่มเล่น</button>
+        </div>
+      </div>
+      <div className="flex gap-2">
+        <input value={url} onChange={e=>setUrl(e.target.value)} onKeyDown={e=>e.key==='Enter'&&submit()}
+          placeholder="วางลิงก์ YouTube (เช่น https://youtu.be/xxxx)" disabled={playlist.length>=30}
+          className="flex-1 bg-[var(--ink)] border border-[var(--line)] rounded-xl px-4 py-2.5 text-sm outline-none focus:border-[var(--amber)] disabled:opacity-50" />
+        <button onClick={submit} disabled={playlist.length>=30} className="bg-[var(--amber)] text-black font-bold px-6 rounded-xl hover:bg-[var(--amber2)] transition disabled:opacity-50 whitespace-nowrap">เพิ่มคลิป</button>
+      </div>
+      {playlist.length>=30 && <p className="text-xs text-[var(--red)] mt-2">ครบ 30 คลิปแล้ว — ลบคลิปเดิมก่อนเพิ่มใหม่</p>}
+    </div>
+
+    <div className="bg-[var(--panel)] border border-[var(--line)] rounded-2xl overflow-hidden">
+      {playlist.length===0
+        ? <div className="p-10 text-center text-[var(--sub)]">ยังไม่มีวิดีโอ — เพิ่มลิงก์ด้านบน วิดีโอจะเล่นวนที่หน้าจอทีวี</div>
+        : <div className="divide-y divide-[var(--line)] max-h-[480px] overflow-y-auto">
+            {playlist.map((p,i)=>(
+              <div key={p.id} className="flex items-center gap-3 p-3">
+                <span className="mono text-[var(--sub)] w-7 text-center">{i+1}</span>
+                <img src={`https://img.youtube.com/vi/${p.vid}/default.jpg`} alt="" className="w-20 h-12 object-cover rounded-lg border border-[var(--line)]" />
+                <div className="flex-1 min-w-0">
+                  <div className="text-sm mono truncate">{p.vid}</div>
+                  <div className="text-xs text-[var(--sub)] truncate">{p.url}</div>
+                </div>
+                <button onClick={()=>removeVideo(p.id)} className="bg-[var(--red)]/15 text-[var(--red)] border border-[var(--red)]/40 px-3 py-1.5 rounded-lg text-xs font-semibold hover:bg-[var(--red)]/25 transition shrink-0">ลบ</button>
+              </div>
+            ))}
+          </div>}
+    </div>
+    <p className="text-xs text-[var(--sub)]">วิดีโอจะเล่นวนที่หน้าจอทีวีพร้อมเสียง · ตอนเรียกคิวระบบจะหรี่เสียงวิดีโอแล้วพูดเสียงเรียก จากนั้นคืนเสียงวิดีโออัตโนมัติ (ไม่หยุดวิดีโอ)</p>
+  </div>;
+}
+
+function AdminView(){
+  const {tickets,updateTicket,removeTicket,setTripsAll,trips,updateTrip,history,addHistory,setHistoryAll,setCall,calling,requestSpeak,statuses,addStatus,playlist,playMode,addVideo,removeVideo,setMode} = useContext(Store);
+  const [tab,setTab] = useState('all');
+  const fileRef = useRef();
+  const histRef = useRef();
+
+  const exportHistory=()=>{
+    const blob=new Blob([JSON.stringify(history,null,2)],{type:'application/json'});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url; a.download='ประวัติเที่ยวรถ_'+new Date().toISOString().slice(0,10)+'.json';
+    a.click(); URL.revokeObjectURL(url);
+  };
+  const handleImport=(e)=>{
+    const file=e.target.files[0]; if(!file)return;
+    const reader=new FileReader();
+    reader.onload=(ev)=>{
+      try{
+        const data=JSON.parse(ev.target.result);
+        // รวมกับของเดิม (กันวันซ้ำ)
+        const merged={...history};
+        Object.entries(data).forEach(([st,dates])=>{
+          const set=new Set([...(merged[st]||[]),...dates]);
+          merged[st]=[...set].sort();
+        });
+        setHistoryAll(merged);
+        alert('นำเข้าประวัติสำเร็จ: '+Object.keys(data).length+' สถานี');
+      }catch(err){ alert('ไฟล์ประวัติไม่ถูกต้อง: '+err.message); }
+    };
+    reader.readAsText(file);
+  };
+
+  const handleFile=(e)=>{
+    const file=e.target.files[0]; if(!file)return;
+    const reader=new FileReader();
+    reader.onload=(ev)=>{
+      try{
+        const wb=XLSX.read(ev.target.result,{type:'array'});
+        const SKIP=['สมุทรสงคราม']; // แท็บที่ไม่เอา (โครงสร้างต่าง)
+        const HEADERS=['ชื่อลูกค้า','เบอร์รถ','เบอร์รถรอบ2','เบอร์รถรอบ3'];
+        const rows=[];
+        wb.SheetNames.forEach((sheetName)=>{
+          if(SKIP.includes(sheetName.trim())) return;
+          const ws=wb.Sheets[sheetName];
+          const aoa=XLSX.utils.sheet_to_json(ws,{header:1,defval:''});
+          aoa.forEach((r,idx)=>{
+            const station=(r[1]||'').toString().trim();   // คอลัมน์ B = ชื่อลูกค้า → สถานีที่โชว์
+            const carC=(r[2]||'').toString().trim();        // คอลัมน์ C = เบอร์รถ
+            const carD=(r[3]||'').toString().trim();        // คอลัมน์ D = เบอร์รถ (สำรอง)
+            const depot=(r[5]||'').toString().trim();       // คอลัมน์ F = คลังที่รับ
+            const trip=(r[4]||'').toString().trim();
+            if(!station || HEADERS.includes(station)) return; // ตัดแถวที่สถานีว่าง/หัวตาราง
+            const clean=v=>(v && !HEADERS.includes(v)) ? v : '';
+            const carNo = clean(carC) || clean(carD);
+            rows.push({id:'trip_'+sheetName+'_'+idx, carNo, station, depot, trip, sheet:sheetName});
+          });
+        });
+        setTripsAll(rows);
+        const sheetsUsed=[...new Set(rows.map(r=>r.sheet))];
+        // ดึงวันที่จากชื่อไฟล์ เช่น PTC_21_06_2026 → 2026-06-21
+        const fileDate=parseFileDate(file.name);
+        if(fileDate){
+          const stations=[...new Set(rows.map(r=>r.station))];
+          addHistory(stations,fileDate);
+          alert('โหลดสำเร็จ '+rows.length+' แถว จาก '+sheetsUsed.length+' แท็บ\nบันทึกประวัติวันที่ '+fileDate+' ('+stations.length+' สถานี)');
+        } else {
+          alert('โหลดสำเร็จ '+rows.length+' แถว จาก '+sheetsUsed.length+' แท็บ\n⚠ อ่านวันที่จากชื่อไฟล์ไม่ได้ — ไม่ได้บันทึกประวัติ\n(ตั้งชื่อไฟล์ให้มีวันที่ เช่น PTC_21_06_2026)');
+        }
+      }catch(err){ alert('อ่านไฟล์ไม่สำเร็จ: '+err.message); }
+    };
+    reader.readAsArrayBuffer(file);
+  };
+
+  const list = (tab==='all' ? tickets : tickets.filter(t=>t.type===tab)).slice().sort((a,b)=>a.createdAt-b.createdAt);
+
+  const callTicket=(t)=>{
+    setCall(t.id);
+    updateTicket(t.id,{status:'กำลังเรียก'});
+    let text=`เชิญคุณ ${t.name}`;
+    if(t.type==='in'){
+      if(t.carNo) text += ` รถเบอร์ ${spellCarNo(t.carNo)}`;
+    } else {
+      if(t.company) text += ` บริษัท ${t.company}`;
+    }
+    text += ' รับตั๋วครับ';
+    requestSpeak(text);
+  };
+
+  return <div className="max-w-6xl mx-auto mt-6">
+    <div className="flex items-center justify-between mb-5 flex-wrap gap-3">
+      <h1 className="display-font text-2xl font-bold">หน้าผู้ดูแล (Admin)</h1>
+      <div className="flex gap-2 flex-wrap">
+        <input ref={fileRef} type="file" accept=".csv,.xls,.xlsx" onChange={handleFile} className="hidden" />
+        <input ref={histRef} type="file" accept=".json" onChange={handleImport} className="hidden" />
+        <button onClick={()=>fileRef.current.click()} className="bg-[var(--panel2)] border border-[var(--line)] hover:border-[var(--amber)] px-4 py-2 rounded-xl text-sm transition">⬆ อัปโหลดไฟล์เที่ยวรถ</button>
+        <button onClick={exportHistory} className="bg-[var(--panel2)] border border-[var(--line)] hover:border-[var(--teal)] px-4 py-2 rounded-xl text-sm transition">💾 Export ประวัติ</button>
+        <button onClick={()=>histRef.current.click()} className="bg-[var(--panel2)] border border-[var(--line)] hover:border-[var(--blue)] px-4 py-2 rounded-xl text-sm transition">📂 Import ประวัติ</button>
+        <button onClick={()=>{
+          const name=prompt('เพิ่มสถานะใหม่ (พิมพ์ชื่อสถานะ):');
+          if(name){ const ok=addStatus(name); alert(ok?'เพิ่มสถานะ "'+name.trim()+'" แล้ว':'มีสถานะนี้อยู่แล้ว หรือชื่อว่าง'); }
+        }} className="bg-[var(--amber)]/15 text-[var(--amber)] border border-[var(--amber)]/40 hover:bg-[var(--amber)]/25 px-4 py-2 rounded-xl text-sm transition">➕ เพิ่มสถานะ</button>
+      </div>
+    </div>
+
+    <div className="flex gap-2 mb-4 flex-wrap">
+      <button onClick={()=>setTab('all')} className={`tabbtn px-5 py-2 rounded-xl font-semibold text-sm ${tab==='all'?'bg-[var(--amber)] text-black':'bg-[var(--panel)] border border-[var(--line)]'}`}>คิวทั้งหมด ({tickets.length})</button>
+      <button onClick={()=>setTab('trips')} className={`tabbtn px-5 py-2 rounded-xl font-semibold text-sm ${tab==='trips'?'bg-[var(--amber)] text-black':'bg-[var(--panel)] border border-[var(--line)]'}`}>🚛 ตารางเที่ยวรถ ({trips.length})</button>
+      <button onClick={()=>setTab('stats')} className={`tabbtn px-5 py-2 rounded-xl font-semibold text-sm ${tab==='stats'?'bg-[var(--amber)] text-black':'bg-[var(--panel)] border border-[var(--line)]'}`}>📊 สถิติสถานี ({Object.keys(history).length})</button>
+      <button onClick={()=>setTab('video')} className={`tabbtn px-5 py-2 rounded-xl font-semibold text-sm ${tab==='video'?'bg-[var(--amber)] text-black':'bg-[var(--panel)] border border-[var(--line)]'}`}>📺 วิดีโอ ({playlist.length})</button>
+    </div>
+
+    {tab==='stats' ? <StatsTable history={history} /> :
+     tab==='trips' ? <TripsTable trips={trips} updateTrip={updateTrip} /> :
+     tab==='video' ? <VideoManager playlist={playlist} playMode={playMode} addVideo={addVideo} removeVideo={removeVideo} setMode={setMode} /> :
+
+    <div className="bg-[var(--panel)] border border-[var(--line)] rounded-2xl overflow-hidden">
+      <div className="overflow-x-auto">
+      <table className="w-full text-sm">
+        <thead><tr className="bg-[var(--ink)] text-[var(--sub)] text-left">
+          <th className="px-4 py-3 font-medium">คิว</th>
+          <th className="px-4 py-3 font-medium">ประเภท</th>
+          <th className="px-4 py-3 font-medium">ชื่อ</th>
+          <th className="px-4 py-3 font-medium">รายละเอียด</th>
+          <th className="px-4 py-3 font-medium">สถานะ</th>
+          <th className="px-4 py-3 font-medium text-right">จัดการ</th>
+        </tr></thead>
+        <tbody>
+          {list.length===0 && <tr><td colSpan="6" className="px-4 py-10 text-center text-[var(--sub)]">ยังไม่มีคิว</td></tr>}
+          {list.map(t=>(
+            <tr key={t.id} className={`border-t border-[var(--line)] ${calling===t.id?'bg-[var(--amber)]/5':''}`}>
+              <td className="px-4 py-3 mono font-bold text-[var(--amber)]">{t.type==='in'?'A':'B'}{String(t.no).padStart(3,'0')}</td>
+              <td className="px-4 py-3">
+                {t.type==='in'
+                  ? <span className="text-xs px-2 py-0.5 rounded-full bg-[var(--blue)]/15 text-[var(--blue)] whitespace-nowrap">ภายใน</span>
+                  : <span className="text-xs px-2 py-0.5 rounded-full bg-[var(--purple)]/15 text-[var(--purple)] whitespace-nowrap">ภายนอก</span>}
+              </td>
+              <td className="px-4 py-3">{t.name}</td>
+              <td className="px-4 py-3">
+                {t.type==='in'
+                  ? <div className="text-xs">
+                      <div>เบอร์รถ: <span className="mono">{t.carNo||'—'}</span></div>
+                      <div className="text-[var(--blue)]">สถานี: {t.station||'—'}</div>
+                    </div>
+                  : <div className="text-xs space-y-0.5">
+                      {t.company && <div className="text-[var(--sub)]">บริษัท: {t.company}</div>}
+                      {t.items&&t.items.length>0
+                        ? t.items.map((it,i)=><div key={i}>{it.product||'—'} · {it.volume||'-'} ล.</div>)
+                        : <div>{t.product||'—'}{t.volume?' · '+t.volume+' ล.':''}</div>}
+                    </div>}
+              </td>
+              <td className="px-4 py-3">
+                <select value={t.status} onChange={e=>updateTicket(t.id,{status:e.target.value})}
+                  className="bg-[var(--ink)] border border-[var(--line)] rounded-lg px-2 py-1.5 text-xs outline-none focus:border-[var(--amber)] max-w-[160px]">
+                  {statuses.map(s=><option key={s}>{s}</option>)}
+                </select>
+              </td>
+              <td className="px-4 py-3 text-right">
+                <div className="flex gap-2 justify-end">
+                  <button onClick={()=>callTicket(t)} className="bg-[var(--amber)] text-black font-semibold px-3 py-1.5 rounded-lg text-xs hover:bg-[var(--amber2)] transition whitespace-nowrap">🔊 เรียกคิว</button>
+                  <button onClick={()=>{ if(confirm(`รับคิว ${t.type==='in'?'A':'B'}${String(t.no).padStart(3,'0')} (${t.name}) เสร็จแล้ว และลบออกจากระบบ?`)) removeTicket(t.id); }} className="bg-[var(--teal)]/15 text-[var(--teal)] border border-[var(--teal)]/40 font-semibold px-3 py-1.5 rounded-lg text-xs hover:bg-[var(--teal)]/25 transition whitespace-nowrap">✓ รับคิวเสร็จ</button>
+                </div>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      </div>
+    </div>
+    }
+    <p className="text-xs text-[var(--sub)] mt-3">ไฟล์เที่ยวรถอ่านจาก: คอลัมน์ B = สถานี · คอลัมน์ C/D = เบอร์รถ · คอลัมน์ F = คลังที่รับ — แก้เบอร์รถได้ที่แท็บ "ตารางเที่ยวรถ"</p>
+  </div>;
+}
+
+/* ===================== TV DISPLAY ===================== */
+function TVView(){
+  const {tickets,calling,speakReq,playlist,playMode} = useContext(Store);
+  const [started,setStarted] = useState(false);
+  const [voiceName,setVoiceName] = useState('');
+  const [rate,setRate] = useState(0.85);
+  const [thaiVoices,setThaiVoices] = useState([]);
+  const [showVoicePanel,setShowVoicePanel] = useState(false);
+  const [apiFailed,setApiFailed] = useState(false);
+  const lastSpoke = useRef(null);
+  const playerRef = useRef(null);
+  const playerReady = useRef(false);
+  const playIdx = useRef(0);
+  const restoreTimer = useRef(null);
+
+  const calledTicket = tickets.find(t=>t.id===calling);
+  const waiting = tickets.filter(t=>t.status!=='ข้ามคิว').sort((a,b)=>a.createdAt-b.createdAt);
+
+  // โหลดรายชื่อเสียงไทย
+  useEffect(()=>{
+    const load=()=>{ const v=getThaiVoices(); setThaiVoices(v); if(!voiceName){const p=pickThaiVoice(); if(p)setVoiceName(p.name);} };
+    load();
+    window.speechSynthesis.onvoiceschanged=load;
+    return ()=>{window.speechSynthesis.onvoiceschanged=null;};
+  },[]);
+
+  // โหลด YouTube IFrame API หลังกดเริ่ม
+  // เก็บ playlist ปัจจุบันใน ref ให้ event handler อ่านได้เสมอ
+  const orderRef = useRef([]);
+  useEffect(()=>{
+    if(!started) return;
+    const order = playMode==='shuffle' ? shuffle(playlist) : playlist;
+    const ids = order.map(p=>p.vid);
+    const startList = ids.length>0 ? ids : ['jfKfPfyJRdk'];
+    orderRef.current = startList;
+    playIdx.current = 0;
+
+    const origin = window.location.origin;
+    const badOrigin = !origin || origin==='null'; // เปิดจาก file:// หรือ sandbox
+    if(badOrigin){ setApiFailed(true); return; } // ใช้ fallback iframe แทน
+    setApiFailed(false);
+
+    let failTimer=setTimeout(()=>{ if(!playerReady.current) setApiFailed(true); }, 6000);
+
+    function nextVideo(target){
+      playIdx.current=(playIdx.current+1)%orderRef.current.length;
+      target.loadVideoById(orderRef.current[playIdx.current]);
+    }
+    function makePlayer(){
+      try{ if(playerRef.current&&playerRef.current.destroy) playerRef.current.destroy(); }catch(e){}
+      playerReady.current=false;
+      try{
+        playerRef.current = new window.YT.Player('tv-player',{
+          host:'https://www.youtube-nocookie.com',
+          playerVars:{autoplay:1,controls:0,rel:0,modestbranding:1,playsinline:1,origin},
+          videoId:startList[0],
+          events:{
+            onReady:(e)=>{ playerReady.current=true; clearTimeout(failTimer); try{e.target.unMute(); e.target.setVolume(100); e.target.playVideo();}catch(err){} },
+            onStateChange:(e)=>{ if(e.data===window.YT.PlayerState.ENDED){ nextVideo(e.target); } },
+            onError:(e)=>{ if(orderRef.current.length>1){ setTimeout(()=>nextVideo(e.target), 500); } }
+          }
+        });
+      }catch(err){ setApiFailed(true); }
+    }
+    if(window.YT && window.YT.Player){ makePlayer(); }
+    else {
+      if(!document.getElementById('yt-iframe-api')){
+        const tag=document.createElement('script'); tag.id='yt-iframe-api'; tag.src='https://www.youtube.com/iframe_api';
+        document.body.appendChild(tag);
+      }
+      window.onYouTubeIframeAPIReady=makePlayer;
+    }
+    return ()=>{ clearTimeout(failTimer); try{playerRef.current&&playerRef.current.destroy();}catch(e){} playerReady.current=false; };
+  },[started,playlist,playMode]);
+
+  // พูดเสียงเรียกคิว + หรี่เสียงวิดีโอ
+  useEffect(()=>{
+    if(!speakReq || speakReq.id===lastSpoke.current) return;
+    lastSpoke.current=speakReq.id;
+    if(!started) return;
+    duckAndSpeak(speakReq.text);
+  },[speakReq,started]);
+
+  const duckAndSpeak=(text)=>{
+    const p=playerRef.current;
+    // หรี่เสียงวิดีโอ (ไม่หยุด)
+    if(p&&playerReady.current){ try{p.setVolume(8);}catch(e){} }
+    const restore=()=>{ if(p&&playerReady.current){ try{p.setVolume(100);}catch(e){} } };
+    // พูด 2 รอบ แล้วคืนเสียง
+    speakThai(text,{voiceName,rate});
+    setTimeout(()=>speakThai(text,{voiceName,rate}), 2600);
+    clearTimeout(restoreTimer.current);
+    restoreTimer.current=setTimeout(restore, 6000);
+  };
+
+  const startShow=()=>{ setStarted(true); /* ปลดล็อกเสียง TTS ด้วย gesture */ try{speakThai(' ',{voiceName,rate});}catch(e){} };
+  const previewVoice=(name)=>{ speakThai('เชิญคุณ สมชาย รถเบอร์ 2 1 2 รับตั๋วครับ',{voiceName:name,rate}); };
+
+  // หน้าจอเริ่มต้น: ปุ่มใหญ่กดด้วยรีโมท
+  if(!started){
+    return <div className="fixed inset-0 bg-[var(--ink)] flex flex-col items-center justify-center z-50 px-6">
+      <div className="text-6xl mb-6">⛽</div>
+      <h1 className="display-font text-3xl md:text-4xl font-bold mb-2 text-center">ระบบคิวรับน้ำมัน</h1>
+      <p className="text-[var(--sub)] mb-10 text-center text-lg">กดปุ่มด้านล่างเพื่อเริ่มแสดงผล (กดครั้งเดียว)</p>
+      <button onClick={startShow} autoFocus
+        className="bg-[var(--amber)] text-black font-bold text-3xl md:text-4xl px-16 py-8 rounded-3xl hover:bg-[var(--amber2)] focus:bg-[var(--amber2)] focus:ring-8 focus:ring-[var(--amber)]/40 focus:outline-none transition ring-4 ring-[var(--amber)]/30">
+        ▶ เริ่มแสดงผล
+      </button>
+      <p className="text-[var(--sub)] text-sm mt-10 text-center max-w-md">ใช้รีโมท: กดปุ่ม OK / Enter เพื่อเริ่ม · หลังกดแล้ว วิดีโอและเสียงเรียกคิวจะทำงานเองตลอด ไม่ต้องกดอีก</p>
+    </div>;
+  }
+
+  return <div className="max-w-7xl mx-auto mt-4">
+    <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
+      <h1 className="display-font text-2xl font-bold">จอแสดงคิว</h1>
+      <button onClick={()=>setShowVoicePanel(v=>!v)} className="tabbtn px-4 py-2 rounded-xl text-sm font-semibold bg-[var(--panel)] border border-[var(--line)] hover:border-[var(--amber)]">🎙 เลือกเสียง</button>
+    </div>
+
+    {showVoicePanel && <div className="bg-[var(--panel)] border border-[var(--line)] rounded-2xl p-5 mb-5 slideup">
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="font-bold display-font">เลือกเสียงเรียกคิว (ภาษาไทย)</h3>
+        <button onClick={()=>setShowVoicePanel(false)} className="text-[var(--sub)] hover:text-[var(--txt)] text-sm">ปิด ✕</button>
+      </div>
+      {thaiVoices.length===0
+        ? <div className="text-sm text-[var(--red)] bg-[var(--ink)] rounded-xl p-4">เครื่องนี้ไม่มีเสียงภาษาไทย — ใช้เสียงเริ่มต้นของเบราว์เซอร์</div>
+        : <div className="space-y-2">
+            <div className="text-sm text-[var(--sub)] mb-2">พบเสียงไทย {thaiVoices.length} เสียง</div>
+            {thaiVoices.map(v=>(
+              <div key={v.name} className={`flex items-center gap-3 p-3 rounded-xl border ${voiceName===v.name?'border-[var(--amber)] bg-[var(--amber)]/5':'border-[var(--line)] bg-[var(--ink)]'}`}>
+                <button onClick={()=>previewVoice(v.name)} className="w-9 h-9 rounded-full bg-[var(--amber)] text-black flex items-center justify-center hover:bg-[var(--amber2)] shrink-0">▶</button>
+                <div className="flex-1 min-w-0"><div className="font-medium truncate">{v.name}</div><div className="text-xs text-[var(--sub)]">{v.lang}{v.localService?' · ในเครื่อง':' · ออนไลน์'}</div></div>
+                <button onClick={()=>setVoiceName(v.name)} className={`px-3 py-1.5 rounded-lg text-xs font-semibold shrink-0 ${voiceName===v.name?'bg-[var(--teal)]/20 text-[var(--teal)] border border-[var(--teal)]/40':'bg-[var(--panel2)] border border-[var(--line)] hover:border-[var(--amber)]'}`}>{voiceName===v.name?'✓ ใช้อยู่':'เลือก'}</button>
+              </div>
+            ))}
+          </div>}
+      <div className="mt-4 pt-4 border-t border-[var(--line)] flex items-center gap-3">
+        <span className="text-sm text-[var(--sub)] whitespace-nowrap">ความเร็ว: {rate.toFixed(2)}x</span>
+        <input type="range" min="0.6" max="1.2" step="0.05" value={rate} onChange={e=>setRate(+e.target.value)} className="flex-1 accent-[var(--amber)]" />
+        <button onClick={()=>previewVoice(voiceName)} className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-[var(--panel2)] border border-[var(--line)] hover:border-[var(--amber)] whitespace-nowrap">▶ ทดสอบ</button>
+      </div>
+    </div>}
+
+    {/* Layout: วิดีโอ + คิว พร้อมกัน */}
+    <div className="grid lg:grid-cols-2 gap-5">
+      <div>
+        {/* แบนเนอร์กำลังเรียกคิว */}
+        <div className={`rounded-3xl p-6 mb-5 text-center border ${calledTicket?'bg-[var(--amber)]/10 border-[var(--amber)] ring':'bg-[var(--panel)] border-[var(--line)]'}`}>
+          <div className="text-[var(--sub)] text-sm tracking-widest uppercase mb-2">กำลังเรียกคิว</div>
+          {calledTicket ? <div className="slideup">
+            <div className="display-font text-6xl font-bold text-[var(--amber)] mono blink">{calledTicket.type==='in'?'A':'B'}{String(calledTicket.no).padStart(3,'0')}</div>
+            <div className="text-2xl mt-2 font-semibold">{calledTicket.name}</div>
+            <div className="text-[var(--sub)]">{calledTicket.type==='in' ? (calledTicket.station?'สถานี '+calledTicket.station:'') : (calledTicket.company||'')}</div>
+            <div className="text-[var(--amber2)] mt-2">กรุณามารับตั๋ว</div>
+          </div> : <div className="text-2xl text-[var(--sub)] py-2">— รอเรียกคิว —</div>}
+        </div>
+        <QueueColumn title="คิวที่รออยู่" list={waiting} calling={calling} />
+      </div>
+      <div>
+        <div className="rounded-2xl overflow-hidden border border-[var(--line)] bg-black sticky top-20" style={{aspectRatio:'16/9'}}>
+          {apiFailed
+            ? <iframe key={(playlist.map(p=>p.vid).join(',')||'def')} width="100%" height="100%"
+                src={ytFallbackSrc(playlist,playMode)}
+                title="video" frameBorder="0" allow="autoplay; encrypted-media" allowFullScreen></iframe>
+            : <div id="tv-player" className="w-full h-full"></div>}
+        </div>
+        {apiFailed && <p className="text-xs text-[var(--amber)] mt-2 text-center">โหมดสำรอง: วิดีโอเล่นได้ แต่ระบบหรี่เสียงอัตโนมัติตอนเรียกคิวไม่ได้ (เปิดผ่านเว็บเซิร์ฟเวอร์/โฮสต์จริงเพื่อใช้ฟีเจอร์เต็ม)</p>}
+        <p className="text-xs text-[var(--sub)] mt-3 text-center">
+          {playlist.length>0 ? `เล่น ${playlist.length} คลิป · ${playMode==='shuffle'?'สุ่มเล่น':'เล่นตามลำดับ'} · เพิ่ม/แก้คลิปได้ที่หน้า Admin` : 'ยังไม่มีคลิป — เพิ่มที่หน้า Admin แท็บวิดีโอ'}
+        </p>
+      </div>
+    </div>
+  </div>;
+}
+
+function shuffle(arr){ const a=[...arr]; for(let i=a.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [a[i],a[j]]=[a[j],a[i]]; } return a; }
+// สร้าง src สำหรับ iframe สำรอง (เล่นวน playlist)
+function ytFallbackSrc(playlist,playMode){
+  const order = playMode==='shuffle' ? shuffle(playlist) : playlist;
+  const ids = order.map(p=>p.vid);
+  const list = ids.length>0 ? ids : ['jfKfPfyJRdk'];
+  const first = list[0];
+  const rest = list.join(',');
+  // loop+playlist ทำให้วนทั้งชุด
+  return `https://www.youtube.com/embed/${first}?autoplay=1&rel=0&modestbranding=1&loop=1&playlist=${rest}`;
+}
+
+function QueueColumn({title,list,calling}){
+  return <div className="bg-[var(--panel)] border border-[var(--line)] rounded-2xl overflow-hidden">
+    <div className="px-5 py-3 border-b border-[var(--line)] flex items-center justify-between">
+      <span className="font-bold text-[var(--amber)]">{title}</span>
+      <span className="text-sm text-[var(--sub)]">{list.length} คิว</span>
+    </div>
+    <div className="divide-y divide-[var(--line)] max-h-[520px] overflow-y-auto">
+      {list.length===0 && <div className="px-5 py-10 text-center text-[var(--sub)]">ไม่มีคิวรอ</div>}
+      {list.map(t=>{
+        const color = t.type==='in' ? 'var(--blue)' : 'var(--purple)';
+        const prefix = t.type==='in' ? 'A' : 'B';
+        const detail = t.type==='in' ? (t.station||'') : (t.company||'');
+        return (
+        <div key={t.id} className={`px-5 py-3 flex items-center justify-between ${calling===t.id?'bg-[var(--amber)]/10':''}`}>
+          <div className="flex items-center gap-4">
+            <span className="mono font-bold text-xl" style={{color}}>{prefix}{String(t.no).padStart(3,'0')}</span>
+            <div>
+              <div className="font-medium flex items-center gap-2">
+                {t.name}
+                <span className="text-[10px] px-1.5 py-0.5 rounded-full" style={{color,backgroundColor:color+'22'}}>{t.type==='in'?'ภายใน':'ภายนอก'}</span>
+              </div>
+              <div className="text-xs text-[var(--sub)]">{detail}</div>
+            </div>
+          </div>
+          <StatusBadge s={t.status} />
+        </div>
+        );
+      })}
+    </div>
+  </div>;
+}
+
+/* ===================== APP SHELL ===================== */
+/* ===================== ADMIN PIN GATE ===================== */
+const ADMIN_PIN = (window.APP_CONFIG && window.APP_CONFIG.ADMIN_PIN) || '123456'; // ตั้งรหัสที่ config.js
+function AdminGate(){
+  const [ok,setOk] = useState(false);
+  const [pin,setPin] = useState('');
+  const [err,setErr] = useState(false);
+  if(ok) return <AdminView/>;
+  const submit=()=>{ if(pin===ADMIN_PIN){setOk(true);setErr(false);} else {setErr(true);setPin('');} };
+  return <div className="max-w-sm mx-auto mt-16 slideup">
+    <div className="bg-[var(--panel)] border border-[var(--line)] rounded-3xl p-8 text-center">
+      <div className="text-4xl mb-3">🔒</div>
+      <h2 className="display-font text-xl font-bold mb-1">เข้าสู่หน้าผู้ดูแล</h2>
+      <p className="text-sm text-[var(--sub)] mb-6">กรอกรหัส 6 หลักเพื่อเข้าใช้งาน</p>
+      <input type="password" inputMode="numeric" maxLength={6} value={pin}
+        onChange={e=>{setPin(e.target.value.replace(/\D/g,''));setErr(false);}}
+        onKeyDown={e=>e.key==='Enter'&&submit()}
+        className={`w-full text-center tracking-[0.5em] mono text-2xl bg-[var(--ink)] border rounded-xl px-4 py-3 outline-none mb-3 ${err?'border-[var(--red)]':'border-[var(--line)] focus:border-[var(--amber)]'}`}
+        placeholder="••••••" autoFocus />
+      {err && <div className="text-[var(--red)] text-sm mb-3">รหัสไม่ถูกต้อง</div>}
+      <button onClick={submit} className="w-full bg-[var(--amber)] text-black font-bold py-3 rounded-xl hover:bg-[var(--amber2)] transition">เข้าสู่ระบบ</button>
+    </div>
+  </div>;
+}
+
+function App(){
+  const [view,setView] = useState('customer');
+  useEffect(()=>{ // warm up voices
+    window.speechSynthesis?.getVoices();
+  },[]);
+  const nav=[['customer','ลูกค้า','🧑'],['admin','Admin','🛠'],['tv','จอทีวี','📺']];
+  return <StoreProvider>
+    <div className="min-h-screen pb-16">
+      <header className="sticky top-0 z-20 bg-[var(--ink)]/90 backdrop-blur border-b border-[var(--line)]">
+        <div className="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between">
+          <div className="display-font font-bold text-lg flex items-center gap-2">⛽ ระบบคิวรับน้ำมัน
+            <span className={`text-[10px] px-2 py-0.5 rounded-full font-normal ${HAS_SUPABASE?'bg-[var(--teal)]/15 text-[var(--teal)]':'bg-[var(--sub)]/15 text-[var(--sub)]'}`}>{HAS_SUPABASE?'☁ ออนไลน์':'เครื่องเดียว'}</span>
+          </div>
+          <div className="flex gap-1 bg-[var(--panel)] p-1 rounded-xl border border-[var(--line)]">
+            {nav.map(([k,l,ic])=>(
+              <button key={k} onClick={()=>setView(k)} className={`tabbtn px-4 py-1.5 rounded-lg text-sm font-semibold ${view===k?'bg-[var(--amber)] text-black':'text-[var(--sub)] hover:text-[var(--txt)]'}`}>{ic} {l}</button>
+            ))}
+          </div>
+        </div>
+      </header>
+      <main className="px-4">
+        {view==='customer' && <CustomerView/>}
+        {view==='admin' && <AdminGate/>}
+        {view==='tv' && <TVView/>}
+      </main>
+      <footer className="fixed bottom-0 inset-x-0 bg-[var(--ink)]/90 backdrop-blur border-t border-[var(--line)] py-2 text-center text-xs text-[var(--sub)]">
+        {HAS_SUPABASE ? 'เชื่อมต่อ Supabase — ข้อมูล sync ข้ามเครื่องและบันทึกถาวร' : 'โหมดเครื่องเดียว — sync เฉพาะแท็บในเครื่องนี้ (ใส่คีย์ Supabase ใน config.js เพื่อ sync ข้ามเครื่อง)'}
+      </footer>
+    </div>
+  </StoreProvider>;
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
