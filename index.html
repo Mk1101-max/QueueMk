@@ -246,7 +246,12 @@ function StoreProvider({children}){
   const addStatus = (name)=>{
     const s=name.trim(); if(!s) return false;
     if(statuses.includes(s)) return false;
-    if(HAS_SUPABASE){ sb.from('statuses').insert({name:s,ord:Date.now()}).then(({error})=>{if(error)console.error(error);}); return true; }
+    if(HAS_SUPABASE){
+      // ord ต้องเป็น int เล็กๆ (ใช้จำนวนสถานะที่เพิ่มเองเป็นลำดับ) ไม่ใช่ Date.now() ที่เกินขนาด int
+      const ord = statuses.length + 1;
+      sb.from('statuses').insert({name:s,ord:ord}).then(({error})=>{if(error){console.error(error); alert('เพิ่มสถานะไม่สำเร็จ: '+error.message);}});
+      return true;
+    }
     setStatuses(prev=>{ if(prev.includes(s)) return prev; const idx=prev.indexOf('กำลังเรียก'); const next=idx>=0?[...prev.slice(0,idx),s,...prev.slice(idx)]:[...prev,s]; broadcast('statuses',next); return next; });
     return true;
   };
