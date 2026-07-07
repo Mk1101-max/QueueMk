@@ -60,6 +60,25 @@ const FIRST_STATUS = DEFAULT_STATUSES[0]; // 'รอออกตั๋ว'
 
 function genId(){return Date.now().toString(36)+Math.random().toString(36).slice(2,6);}
 
+// คำนวณระยะทางระหว่าง 2 พิกัด (เมตร) ด้วยสูตร Haversine
+function distanceMeters(lat1,lon1,lat2,lon2){
+  const R=6371000; const toRad=x=>x*Math.PI/180;
+  const dLat=toRad(lat2-lat1), dLon=toRad(lon2-lon1);
+  const a=Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+  return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));
+}
+// ขอตำแหน่งปัจจุบัน คืน Promise({lat,lng}) หรือ reject
+function getCurrentPos(){
+  return new Promise((resolve,reject)=>{
+    if(!navigator.geolocation){ reject(new Error('อุปกรณ์นี้ไม่รองรับ GPS')); return; }
+    navigator.geolocation.getCurrentPosition(
+      p=>resolve({lat:p.coords.latitude,lng:p.coords.longitude}),
+      e=>reject(e),
+      {enableHighAccuracy:true,timeout:10000,maximumAge:0}
+    );
+  });
+}
+
 // ดึง YouTube video id จาก url หรือ id ตรงๆ
 function extractYtId(input){
   if(!input) return null;
@@ -104,6 +123,7 @@ function StoreProvider({children}){
   const [statuses,setStatuses] = useState(DEFAULT_STATUSES);
   const [playlist,setPlaylist] = useState([]);
   const [playMode,setPlayMode] = useState('order');
+  const [geofence,setGeofence] = useState(null); // {lat,lng,radius} หรือ null=ปิด
 
   const broadcast = (type,payload)=>{ if(!HAS_SUPABASE) CH.postMessage({type,payload}); };
   const sbChannelRef = useRef(null);
@@ -131,7 +151,7 @@ function StoreProvider({children}){
         setStatuses([...DEFAULT_STATUSES.slice(0,idx),...extra,...DEFAULT_STATUSES.slice(idx)]); }
       if(pl.data) setPlaylist(pl.data.map(r=>({id:r.id,url:r.url,vid:r.vid})));
       if(hi.data){ const h={}; hi.data.forEach(r=>{ (h[r.station]=h[r.station]||[]).push(r.date); }); Object.keys(h).forEach(k=>h[k].sort()); setHistory(h); }
-      if(ap.data){ ap.data.forEach(r=>{ if(r.key==='playMode') setPlayMode(r.value); if(r.key==='calling') setCalling(r.value); }); }
+      if(ap.data){ ap.data.forEach(r=>{ if(r.key==='playMode') setPlayMode(r.value); if(r.key==='calling') setCalling(r.value); if(r.key==='geofence') setGeofence(r.value); }); }
     };
     loadAll();
     const reloadTickets=async()=>{ const {data}=await sb.from('tickets').select('*'); if(active&&data) setTickets(data.map(rowToTicket)); };
@@ -144,7 +164,7 @@ function StoreProvider({children}){
       .on('postgres_changes',{event:'*',schema:'public',table:'playlist'},loadAll)
       .on('postgres_changes',{event:'*',schema:'public',table:'history'},loadAll)
       .on('postgres_changes',{event:'*',schema:'public',table:'app_state'},(p)=>{
-        const r=p.new||{}; if(r.key==='playMode') setPlayMode(r.value); if(r.key==='calling') setCalling(r.value);
+        const r=p.new||{}; if(r.key==='playMode') setPlayMode(r.value); if(r.key==='calling') setCalling(r.value); if(r.key==='geofence') setGeofence(r.value);
       })
       // เสียงเรียกคิว: ส่งสดผ่าน broadcast (ไม่แตะ DB — เร็วและไม่ติดปัญหา row ไม่เปลี่ยน)
       .on('broadcast',{event:'speak'},(msg)=>{ if(msg&&msg.payload) setSpeakReq(msg.payload); })
@@ -274,8 +294,12 @@ function StoreProvider({children}){
     if(HAS_SUPABASE){ sb.from('app_state').upsert({key:'playMode',value:m}).then(({error})=>{if(error)console.error(error);}); setPlayMode(m); }
     else { setPlayMode(m); broadcast('playmode',m); }
   };
+  const setGeofenceVal = (g)=>{
+    if(HAS_SUPABASE){ sb.from('app_state').upsert({key:'geofence',value:g}).then(({error})=>{if(error)console.error(error);}); setGeofence(g); }
+    else { setGeofence(g); broadcast('geofence',g); }
+  };
 
-  return <Store.Provider value={{tickets,trips,calling,history,speakReq,statuses,playlist,playMode,addTicket,updateTicket,removeTicket,setTripsAll,updateTrip,addHistory,setHistoryAll,setCall,requestSpeak,addStatus,addVideo,removeVideo,setMode,setPlaylistAll}}>{children}</Store.Provider>;
+  return <Store.Provider value={{tickets,trips,calling,history,speakReq,statuses,playlist,playMode,geofence,addTicket,updateTicket,removeTicket,setTripsAll,updateTrip,addHistory,setHistoryAll,setCall,requestSpeak,addStatus,addVideo,removeVideo,setMode,setPlaylistAll,setGeofenceVal}}>{children}</Store.Provider>;
 }
 
 /* ---------- Thai TTS (Google TTS หลัก + speechSynthesis สำรอง) ---------- */
@@ -451,12 +475,12 @@ function CustomerView(){
       <div className="grid md:grid-cols-2 gap-5">
         <button onClick={()=>setMode('in')} className="group bg-[var(--panel)] hover:bg-[var(--panel2)] border border-[var(--line)] hover:border-[var(--amber)] rounded-3xl p-8 text-left transition">
           <div className="text-4xl mb-3">🚛</div>
-          <div className="display-font text-xl font-bold mb-1">ลูกค้าภายใน</div>
+          <div className="display-font text-xl font-bold mb-1">รถบริษัท</div>
           <p className="text-sm text-[var(--sub)]">กรอกเบอร์รถ ระบบจะแมชเที่ยวรถและสถานีให้อัตโนมัติ</p>
         </button>
         <button onClick={()=>setMode('out')} className="group bg-[var(--panel)] hover:bg-[var(--panel2)] border border-[var(--line)] hover:border-[var(--amber)] rounded-3xl p-8 text-left transition">
           <div className="text-4xl mb-3">🏭</div>
-          <div className="display-font text-xl font-bold mb-1">ลูกค้าภายนอก</div>
+          <div className="display-font text-xl font-bold mb-1">รถลูกค้า</div>
           <p className="text-sm text-[var(--sub)]">กรอกรายการรับน้ำมันด้วยตนเอง</p>
         </button>
       </div>
@@ -515,27 +539,58 @@ function InternalForm({trips,onBack,onSubmit}){
 }
 
 function ExternalForm({onBack,onSubmit}){
-  const [f,setF] = useState({name:'',company:'',phone:'',plate:'',note:''});
+  const {geofence} = useContext(Store);
+  const [f,setF] = useState({name:'',company:'',phone:'',plate:'',seal:'',note:''});
   const [items,setItems] = useState(Array.from({length:6},()=>({product:'',volume:''})));
   const [err,setErr] = useState('');
+  const [checking,setChecking] = useState(false);
+  const [geoDenied,setGeoDenied] = useState(false);
   const set=(k,v)=>setF(p=>({...p,[k]:v}));
   const setItem=(i,k,v)=>setItems(prev=>prev.map((it,idx)=>idx===i?{...it,[k]:v}:it));
-  const submit=()=>{
-    if(!f.name||!f.company){setErr('กรุณากรอกชื่อและบริษัท');return;}
+
+  const doSubmit=()=>{
     const filled = items.filter(it=>it.product||it.volume);
-    onSubmit({type:'out',...f,items:filled,
+    const noteWithSeal = f.seal ? (f.note?`${f.note} · จำนวนซีล: ${f.seal}`:`จำนวนซีล: ${f.seal}`) : f.note;
+    onSubmit({type:'out',...f, note:noteWithSeal, company:f.company, items:filled,
       product:filled[0]?.product||'', volume:filled[0]?.volume||'', station:'-'});
   };
+
+  const submit=async()=>{
+    setErr('');
+    if(!f.name){setErr('กรุณากรอกชื่อลูกค้า');return;}
+    // ข้อ 5: ถ้าตั้ง geofence ไว้ ต้องเช็คระยะก่อนรับคิว
+    if(geofence && geofence.lat){
+      setChecking(true); setGeoDenied(false);
+      try{
+        const pos=await getCurrentPos();
+        const dist=distanceMeters(pos.lat,pos.lng,geofence.lat,geofence.lng);
+        const radius=geofence.radius||500;
+        setChecking(false);
+        if(dist>radius){
+          setErr(`คุณอยู่ห่างจากจุดรับคิว ${Math.round(dist)} เมตร (ต้องอยู่ภายใน ${radius} เมตร) — กรุณาเข้ามาใกล้ก่อนกดรับคิว`);
+          return;
+        }
+        doSubmit();
+      }catch(e){
+        setChecking(false);
+        setGeoDenied(true);
+        setErr('ต้องอนุญาตให้เข้าถึงตำแหน่ง (GPS) เพื่อกดรับคิว');
+      }
+    } else {
+      doSubmit();
+    }
+  };
+
   return <div className="max-w-xl mx-auto mt-8 slideup">
     <button onClick={onBack} className="text-[var(--sub)] hover:text-[var(--txt)] mb-4 text-sm">← กลับ</button>
     <div className="bg-[var(--panel)] border border-[var(--line)] rounded-3xl p-7">
-      <h2 className="display-font text-xl font-bold mb-5">ลูกค้าภายนอก · รายการรับน้ำมัน</h2>
+      <h2 className="display-font text-xl font-bold mb-5">รถลูกค้า · รายการรับน้ำมัน</h2>
       <div className="space-y-4">
         <div className="grid grid-cols-2 gap-4">
           <Field label="ชื่อผู้ติดต่อ"><input className={inputCls} value={f.name} onChange={e=>set('name',e.target.value)} /></Field>
           <Field label="เบอร์โทร"><input className={inputCls} value={f.phone} onChange={e=>set('phone',e.target.value)} /></Field>
         </div>
-        <Field label="บริษัท"><input className={inputCls} value={f.company} onChange={e=>set('company',e.target.value)} /></Field>
+        <Field label="ชื่อลูกค้า"><input className={inputCls} value={f.company} onChange={e=>set('company',e.target.value)} /></Field>
         <div>
           <span className="text-sm font-medium text-[var(--sub)] mb-1.5 block">รายการรับน้ำมัน (ไม่บังคับ กรอกเท่าที่ต้องการ)</span>
           <div className="space-y-2">
@@ -543,17 +598,24 @@ function ExternalForm({onBack,onSubmit}){
               <div key={i} className="grid grid-cols-2 gap-2">
                 <select className={inputCls+' py-2.5'} value={it.product} onChange={e=>setItem(i,'product',e.target.value)}>
                   <option value="">— ชนิดน้ำมัน {i+1} —</option>
-                  {['ดีเซล','เบนซิน 95','แก๊สโซฮอล์ 91','แก๊สโซฮอล์ 95','แก๊สโซฮอล์ E20','น้ำมันเตา'].map(o=><option key={o}>{o}</option>)}
+                  {['ดีเซล','เบนซิน 95','แก๊สโซฮอล์ 91','แก๊สโซฮอล์ 95','แก๊สโซฮอล์ E20'].map(o=><option key={o}>{o}</option>)}
                 </select>
                 <input className={inputCls+' py-2.5'} value={it.volume} onChange={e=>setItem(i,'volume',e.target.value)} placeholder="ปริมาณ (ลิตร)" />
               </div>
             ))}
           </div>
         </div>
-        <Field label="ทะเบียนรถ"><input className={inputCls} value={f.plate} onChange={e=>set('plate',e.target.value)} /></Field>
+        <div className="grid grid-cols-2 gap-4">
+          <Field label="ทะเบียนรถ"><input className={inputCls} value={f.plate} onChange={e=>set('plate',e.target.value)} /></Field>
+          <Field label="จำนวนซีล"><input className={inputCls} value={f.seal} onChange={e=>set('seal',e.target.value)} placeholder="เช่น 4" /></Field>
+        </div>
         <Field label="หมายเหตุ"><input className={inputCls} value={f.note} onChange={e=>set('note',e.target.value)} /></Field>
         {err && <div className="text-[var(--red)] text-sm">{err}</div>}
-        <button onClick={submit} className="w-full bg-[var(--amber)] text-black font-bold py-3 rounded-xl hover:bg-[var(--amber2)] transition">รับคิว</button>
+        {geoDenied && <button onClick={submit} className="w-full bg-[var(--blue)]/15 text-[var(--blue)] border border-[var(--blue)]/40 font-semibold py-2.5 rounded-xl text-sm">📍 ขอสิทธิ์ตำแหน่งอีกครั้ง</button>}
+        <button onClick={submit} disabled={checking} className="w-full bg-[var(--amber)] text-black font-bold py-3 rounded-xl hover:bg-[var(--amber2)] transition disabled:opacity-60">
+          {checking?'กำลังตรวจสอบตำแหน่ง...':'รับคิว'}
+        </button>
+        {geofence && geofence.lat && <p className="text-xs text-[var(--sub)] text-center">📍 ระบบจะตรวจสอบว่าคุณอยู่ภายใน {geofence.radius||500} เมตรจากจุดรับคิว</p>}
       </div>
     </div>
   </div>;
@@ -727,7 +789,7 @@ function VideoManager({playlist,playMode,addVideo,removeVideo,setMode}){
 }
 
 function AdminView(){
-  const {tickets,updateTicket,removeTicket,setTripsAll,trips,updateTrip,history,addHistory,setHistoryAll,setCall,calling,requestSpeak,statuses,addStatus,playlist,playMode,addVideo,removeVideo,setMode} = useContext(Store);
+  const {tickets,updateTicket,removeTicket,setTripsAll,trips,updateTrip,history,addHistory,setHistoryAll,setCall,calling,requestSpeak,statuses,addStatus,playlist,playMode,addVideo,removeVideo,setMode,geofence,setGeofenceVal} = useContext(Store);
   const [tab,setTab] = useState('all');
   const fileRef = useRef();
   const histRef = useRef();
@@ -827,6 +889,19 @@ function AdminView(){
           const name=prompt('เพิ่มสถานะใหม่ (พิมพ์ชื่อสถานะ):');
           if(name){ const ok=addStatus(name); alert(ok?'เพิ่มสถานะ "'+name.trim()+'" แล้ว':'มีสถานะนี้อยู่แล้ว หรือชื่อว่าง'); }
         }} className="bg-[var(--amber)]/15 text-[var(--amber)] border border-[var(--amber)]/40 hover:bg-[var(--amber)]/25 px-4 py-2 rounded-xl text-sm transition">➕ เพิ่มสถานะ</button>
+        <button onClick={async()=>{
+          if(geofence && geofence.lat){
+            if(confirm(`จุดรับคิวปัจจุบัน:\nพิกัด ${geofence.lat.toFixed(5)}, ${geofence.lng.toFixed(5)}\nรัศมี ${geofence.radius||500} เมตร\n\nกด OK เพื่อตั้งใหม่ (ตำแหน่งปัจจุบัน) · กด Cancel เพื่อปิดการเช็คระยะ`)){
+              try{ const pos=await getCurrentPos(); const rad=prompt('รัศมีที่อนุญาต (เมตร):','500'); setGeofenceVal({lat:pos.lat,lng:pos.lng,radius:parseInt(rad)||500}); alert('ตั้งจุดรับคิวใหม่แล้ว'); }
+              catch(e){ alert('ดึงตำแหน่งไม่สำเร็จ: อนุญาตการเข้าถึง GPS ก่อน'); }
+            } else { setGeofenceVal(null); alert('ปิดการเช็คระยะแล้ว — ลูกค้ากดรับคิวได้จากทุกที่'); }
+          } else {
+            if(confirm('ตั้งจุดรับคิวจากตำแหน่งปัจจุบัน?\n(ลูกค้ารถลูกค้าจะกดรับคิวได้เมื่ออยู่ในระยะที่กำหนดเท่านั้น)')){
+              try{ const pos=await getCurrentPos(); const rad=prompt('รัศมีที่อนุญาต (เมตร):','500'); setGeofenceVal({lat:pos.lat,lng:pos.lng,radius:parseInt(rad)||500}); alert('ตั้งจุดรับคิวแล้ว'); }
+              catch(e){ alert('ดึงตำแหน่งไม่สำเร็จ: อนุญาตการเข้าถึง GPS ก่อน'); }
+            }
+          }
+        }} className={`px-4 py-2 rounded-xl text-sm transition border ${geofence&&geofence.lat?'bg-[var(--teal)]/15 text-[var(--teal)] border-[var(--teal)]/40':'bg-[var(--panel2)] border-[var(--line)] hover:border-[var(--teal)]'}`}>📍 {geofence&&geofence.lat?`จุดรับคิว (${geofence.radius||500}ม.)`:'ตั้งจุดรับคิว'}</button>
       </div>
     </div>
 
@@ -958,7 +1033,12 @@ function TVView(){
           playerVars:{autoplay:1,controls:0,rel:0,modestbranding:1,playsinline:1,origin},
           videoId:startList[0],
           events:{
-            onReady:(e)=>{ playerReady.current=true; clearTimeout(failTimer); try{e.target.unMute(); e.target.setVolume(100); e.target.playVideo();}catch(err){} },
+            onReady:(e)=>{
+              playerReady.current=true; clearTimeout(failTimer);
+              try{e.target.unMute(); e.target.setVolume(100); e.target.playVideo();}catch(err){}
+              // ให้แอป Android เรียกหรี่/คืนเสียง YouTube ได้ (แยกจากเสียงพูด TTS)
+              window.__duckVideo=(duck)=>{ try{ e.target.setVolume(duck?8:100); }catch(x){} };
+            },
             onStateChange:(e)=>{ if(e.data===window.YT.PlayerState.ENDED){ nextVideo(e.target); } },
             onError:(e)=>{ if(orderRef.current.length>1){ setTimeout(()=>nextVideo(e.target), 500); } }
           }
@@ -991,13 +1071,16 @@ function TVView(){
     const myToken=++duckTokenRef.current;
     stopSpeak();
     clearTimeout(restoreTimer.current);
-    if(p&&playerReady.current){ try{p.setVolume(10);}catch(e){} }
-    const restore=()=>{ if(myToken===duckTokenRef.current && p&&playerReady.current){ try{p.setVolume(100);}catch(e){} } };
+    // ในแอป Android: แอปหรี่เสียง YouTube เองผ่าน window.__duckVideo ตอน TTS เริ่ม/จบ
+    // ในเว็บปกติ: หรี่ที่นี่
+    const inApp = hasNativeTTS();
+    if(!inApp && p&&playerReady.current){ try{p.setVolume(8);}catch(e){} }
+    const restore=()=>{ if(!inApp && myToken===duckTokenRef.current && p&&playerReady.current){ try{p.setVolume(100);}catch(e){} } };
     speakingRef.current=true;
     try{
       await speakThai(text,{voiceName,rate,engine});  // พูดรอบเดียว รอจบจริง
     }catch(e){}
-    if(myToken!==duckTokenRef.current) return; // มีการเรียกใหม่ทับแล้ว ไม่ต้องคืนเสียง
+    if(myToken!==duckTokenRef.current) return;
     speakingRef.current=false;
     restoreTimer.current=setTimeout(restore, 500);
   };
