@@ -123,8 +123,8 @@ if(HAS_SUPABASE && window.supabase){
   try{ sb = window.supabase.createClient(CFG.SUPABASE_URL, CFG.SUPABASE_ANON_KEY); }catch(e){ console.error('Supabase init error',e); }
 }
 // แปลง ticket object <-> แถวในฐานข้อมูล (snake_case)
-const ticketToRow = (t)=>({id:t.id,type:t.type,no:t.no,name:t.name,car_no:t.carNo,station:t.station,depot:t.depot,trip:t.trip,company:t.company,phone:t.phone,plate:t.plate,note:t.note,product:t.product,volume:t.volume,items:t.items||null,status:t.status,created_at:t.createdAt});
-const rowToTicket = (r)=>({id:r.id,type:r.type,no:r.no,name:r.name,carNo:r.car_no,station:r.station,depot:r.depot,trip:r.trip,company:r.company,phone:r.phone,plate:r.plate,note:r.note,product:r.product,volume:r.volume,items:r.items,status:r.status,createdAt:r.created_at});
+const ticketToRow = (t)=>({id:t.id,type:t.type,no:t.no,name:t.name,car_no:t.carNo,station:t.station,depot:t.depot,trip:t.trip,company:t.company,phone:t.phone,plate:t.plate,seal:t.seal,note:t.note,product:t.product,volume:t.volume,items:t.items||null,status:t.status,created_at:t.createdAt});
+const rowToTicket = (r)=>({id:r.id,type:r.type,no:r.no,name:r.name,carNo:r.car_no,station:r.station,depot:r.depot,trip:r.trip,company:r.company,phone:r.phone,plate:r.plate,seal:r.seal,note:r.note,product:r.product,volume:r.volume,items:r.items,status:r.status,createdAt:r.created_at});
 const tripToRow = (t)=>({id:t.id,car_no:t.carNo,station:t.station,depot:t.depot,trip:t.trip,sheet:t.sheet});
 const rowToTrip = (r)=>({id:r.id,carNo:r.car_no,station:r.station,depot:r.depot,trip:r.trip,sheet:r.sheet});
 
@@ -574,8 +574,7 @@ function ExternalForm({onBack,onSubmit}){
 
   const doSubmit=()=>{
     const filled = items.filter(it=>it.product||it.volume);
-    const noteWithSeal = f.seal ? (f.note?`${f.note} · จำนวนซีล: ${f.seal}`:`จำนวนซีล: ${f.seal}`) : f.note;
-    onSubmit({type:'out',...f, note:noteWithSeal, company:f.company, items:filled,
+    onSubmit({type:'out',...f, seal:f.seal, company:f.company, items:filled,
       product:filled[0]?.product||'', volume:filled[0]?.volume||'', station:'-'});
   };
 
@@ -994,7 +993,9 @@ function AdminView(){
                       <div className="text-[var(--blue)]">สถานี: {t.station||'—'}</div>
                     </div>
                   : <div className="text-xs space-y-0.5">
-                      {t.company && <div className="text-[var(--sub)]">บริษัท: {t.company}</div>}
+                      {t.company && <div className="text-[var(--sub)]">ชื่อลูกค้า: <span className="text-[var(--txt)]">{t.company}</span></div>}
+                      {t.plate && <div className="text-[var(--sub)]">ทะเบียนรถ: <span className="mono text-[var(--txt)]">{t.plate}</span></div>}
+                      {t.seal && <div className="text-[var(--sub)]">จำนวนซีล: <span className="text-[var(--txt)]">{t.seal}</span></div>}
                       {t.items&&t.items.length>0
                         ? t.items.map((it,i)=><div key={i}>{it.product||'—'} · {it.volume||'-'} ล.</div>)
                         : <div>{t.product||'—'}{t.volume?' · '+t.volume+' ล.':''}</div>}
