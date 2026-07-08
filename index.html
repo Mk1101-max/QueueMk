@@ -67,6 +67,20 @@ function distanceMeters(lat1,lon1,lat2,lon2){
   const a=Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
   return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));
 }
+// เช็คว่าอยู่ในระยะ geofence ไหม คืน {ok, msg, denied}
+async function checkGeofence(geofence){
+  if(!geofence || geofence.lat==null) return {ok:true};
+  try{
+    const pos=await getCurrentPos();
+    const dist=distanceMeters(pos.lat,pos.lng,geofence.lat,geofence.lng);
+    const radius=geofence.radius||500;
+    if(dist>radius) return {ok:false,msg:`คุณอยู่ห่างจากจุดรับคิว ${Math.round(dist)} เมตร (ต้องอยู่ภายใน ${radius} เมตร) — กรุณาเข้ามาใกล้ก่อนกดรับคิว`};
+    return {ok:true};
+  }catch(e){
+    return {ok:false,denied:true,msg:'ต้องอนุญาตให้เข้าถึงตำแหน่ง (GPS) เพื่อกดรับคิว'};
+  }
+}
+
 // ขอตำแหน่งปัจจุบัน คืน Promise({lat,lng}) หรือ reject
 function getCurrentPos(){
   return new Promise((resolve,reject)=>{
@@ -492,10 +506,13 @@ function CustomerView(){
 }
 
 function InternalForm({trips,onBack,onSubmit}){
+  const {geofence} = useContext(Store);
   const [carNo,setCarNo] = useState('');
   const [name,setName] = useState('');
   const [matched,setMatched] = useState(null);
   const [err,setErr] = useState('');
+  const [checking,setChecking] = useState(false);
+  const [geoDenied,setGeoDenied] = useState(false);
 
   useEffect(()=>{
     if(!carNo){setMatched(null);return;}
@@ -509,15 +526,20 @@ function InternalForm({trips,onBack,onSubmit}){
     setMatched(m||null);
   },[carNo,trips]);
 
-  const submit=()=>{
+  const submit=async()=>{
+    setErr('');
     if(!carNo||!name){setErr('กรุณากรอกเบอร์รถและชื่อ');return;}
+    setChecking(true); setGeoDenied(false);
+    const res=await checkGeofence(geofence);
+    setChecking(false);
+    if(!res.ok){ setErr(res.msg); setGeoDenied(!!res.denied); return; }
     onSubmit({type:'in',carNo,name,station:matched?.station||'',depot:matched?.depot||'',trip:matched?.trip||''});
   };
 
   return <div className="max-w-xl mx-auto mt-8 slideup">
     <button onClick={onBack} className="text-[var(--sub)] hover:text-[var(--txt)] mb-4 text-sm">← กลับ</button>
     <div className="bg-[var(--panel)] border border-[var(--line)] rounded-3xl p-7">
-      <h2 className="display-font text-xl font-bold mb-5">ลูกค้าภายใน · กรอกเบอร์รถ</h2>
+      <h2 className="display-font text-xl font-bold mb-5">รถบริษัท · กรอกเบอร์รถ</h2>
       <div className="space-y-4">
         <Field label="เบอร์รถ"><input className={inputCls} value={carNo} onChange={e=>setCarNo(e.target.value)} placeholder="เช่น 70-1234" /></Field>
         {carNo && (matched
@@ -532,7 +554,9 @@ function InternalForm({trips,onBack,onSubmit}){
           : <div className="bg-[var(--ink)] border border-[var(--red)]/40 rounded-xl p-3 text-sm text-[var(--red)]">ไม่พบเบอร์รถนี้ในไฟล์ — รับคิวได้ สถานีจะเว้นว่างไว้</div>)}
         <Field label="ชื่อผู้ขับ / ผู้ติดต่อ"><input className={inputCls} value={name} onChange={e=>setName(e.target.value)} placeholder="ชื่อ-นามสกุล" /></Field>
         {err && <div className="text-[var(--red)] text-sm">{err}</div>}
-        <button onClick={submit} className="w-full bg-[var(--amber)] text-black font-bold py-3 rounded-xl hover:bg-[var(--amber2)] transition">รับคิว</button>
+        {geoDenied && <button onClick={submit} className="w-full bg-[var(--blue)]/15 text-[var(--blue)] border border-[var(--blue)]/40 font-semibold py-2.5 rounded-xl text-sm">📍 ขอสิทธิ์ตำแหน่งอีกครั้ง</button>}
+        <button onClick={submit} disabled={checking} className="w-full bg-[var(--amber)] text-black font-bold py-3 rounded-xl hover:bg-[var(--amber2)] transition disabled:opacity-60">{checking?'กำลังตรวจสอบตำแหน่ง...':'รับคิว'}</button>
+        {geofence && geofence.lat && <p className="text-xs text-[var(--sub)] text-center">📍 ระบบจะตรวจสอบว่าคุณอยู่ภายใน {geofence.radius||500} เมตรจากจุดรับคิว</p>}
       </div>
     </div>
   </div>;
@@ -558,27 +582,11 @@ function ExternalForm({onBack,onSubmit}){
   const submit=async()=>{
     setErr('');
     if(!f.name){setErr('กรุณากรอกชื่อลูกค้า');return;}
-    // ข้อ 5: ถ้าตั้ง geofence ไว้ ต้องเช็คระยะก่อนรับคิว
-    if(geofence && geofence.lat){
-      setChecking(true); setGeoDenied(false);
-      try{
-        const pos=await getCurrentPos();
-        const dist=distanceMeters(pos.lat,pos.lng,geofence.lat,geofence.lng);
-        const radius=geofence.radius||500;
-        setChecking(false);
-        if(dist>radius){
-          setErr(`คุณอยู่ห่างจากจุดรับคิว ${Math.round(dist)} เมตร (ต้องอยู่ภายใน ${radius} เมตร) — กรุณาเข้ามาใกล้ก่อนกดรับคิว`);
-          return;
-        }
-        doSubmit();
-      }catch(e){
-        setChecking(false);
-        setGeoDenied(true);
-        setErr('ต้องอนุญาตให้เข้าถึงตำแหน่ง (GPS) เพื่อกดรับคิว');
-      }
-    } else {
-      doSubmit();
-    }
+    setChecking(true); setGeoDenied(false);
+    const res=await checkGeofence(geofence);
+    setChecking(false);
+    if(!res.ok){ setErr(res.msg); setGeoDenied(!!res.denied); return; }
+    doSubmit();
   };
 
   return <div className="max-w-xl mx-auto mt-8 slideup">
@@ -788,9 +796,60 @@ function VideoManager({playlist,playMode,addVideo,removeVideo,setMode}){
   </div>;
 }
 
+function GeofencePanel({geofence,setGeofenceVal,onClose}){
+  const [lat,setLat] = useState(geofence?.lat!=null?String(geofence.lat):'');
+  const [lng,setLng] = useState(geofence?.lng!=null?String(geofence.lng):'');
+  const [radius,setRadius] = useState(geofence?.radius!=null?String(geofence.radius):'500');
+  const [msg,setMsg] = useState('');
+
+  const useCurrent=async()=>{
+    setMsg('กำลังดึงตำแหน่ง...');
+    try{ const pos=await getCurrentPos(); setLat(pos.lat.toFixed(6)); setLng(pos.lng.toFixed(6)); setMsg('ดึงตำแหน่งปัจจุบันแล้ว'); }
+    catch(e){ setMsg('ดึงตำแหน่งไม่สำเร็จ — อนุญาต GPS ก่อน หรือกรอกเอง'); }
+  };
+  const save=()=>{
+    const la=parseFloat(lat), ln=parseFloat(lng), r=parseInt(radius);
+    if(isNaN(la)||isNaN(ln)){ setMsg('กรุณากรอก lat/long ให้ถูกต้อง'); return; }
+    if(la<-90||la>90||ln<-180||ln>180){ setMsg('ค่าพิกัดไม่ถูกต้อง (lat -90..90, long -180..180)'); return; }
+    setGeofenceVal({lat:la,lng:ln,radius:isNaN(r)||r<=0?500:r});
+    setMsg('บันทึกจุดรับคิวแล้ว'); setTimeout(onClose,800);
+  };
+  const disable=()=>{ setGeofenceVal(null); setMsg('ปิดการเช็คระยะแล้ว'); setTimeout(onClose,800); };
+
+  return <div className="bg-[var(--panel)] border border-[var(--line)] rounded-2xl p-5 mb-4 slideup">
+    <div className="flex items-center justify-between mb-3">
+      <h3 className="font-bold display-font">📍 ตั้งจุดรับคิว (เช็คระยะ GPS)</h3>
+      <button onClick={onClose} className="text-[var(--sub)] hover:text-[var(--txt)] text-sm">ปิด ✕</button>
+    </div>
+    <p className="text-sm text-[var(--sub)] mb-4">กำหนดพิกัดศูนย์กลางและรัศมี ลูกค้า (ทั้งรถบริษัทและรถลูกค้า) จะกดรับคิวได้เมื่ออยู่ในระยะที่กำหนดเท่านั้น</p>
+    <div className="grid sm:grid-cols-3 gap-3 mb-3">
+      <div>
+        <label className="text-xs text-[var(--sub)] mb-1 block">Latitude (ละติจูด)</label>
+        <input className={inputCls} value={lat} onChange={e=>setLat(e.target.value)} placeholder="เช่น 13.756331" />
+      </div>
+      <div>
+        <label className="text-xs text-[var(--sub)] mb-1 block">Longitude (ลองจิจูด)</label>
+        <input className={inputCls} value={lng} onChange={e=>setLng(e.target.value)} placeholder="เช่น 100.501765" />
+      </div>
+      <div>
+        <label className="text-xs text-[var(--sub)] mb-1 block">รัศมี (เมตร)</label>
+        <input className={inputCls} value={radius} onChange={e=>setRadius(e.target.value)} placeholder="500" />
+      </div>
+    </div>
+    <div className="flex gap-2 flex-wrap items-center">
+      <button onClick={useCurrent} className="bg-[var(--blue)]/15 text-[var(--blue)] border border-[var(--blue)]/40 px-4 py-2 rounded-xl text-sm font-semibold hover:bg-[var(--blue)]/25 transition">📱 ดึงตำแหน่งปัจจุบัน</button>
+      <button onClick={save} className="bg-[var(--amber)] text-black px-6 py-2 rounded-xl text-sm font-bold hover:bg-[var(--amber2)] transition">บันทึก</button>
+      {geofence&&geofence.lat && <button onClick={disable} className="bg-[var(--red)]/15 text-[var(--red)] border border-[var(--red)]/40 px-4 py-2 rounded-xl text-sm font-semibold hover:bg-[var(--red)]/25 transition">ปิดการเช็คระยะ</button>}
+      {msg && <span className="text-sm text-[var(--sub)]">{msg}</span>}
+    </div>
+    <p className="text-xs text-[var(--sub)] mt-3">หาพิกัดได้จาก Google Maps: คลิกขวาจุดที่ต้องการ → คัดลอกเลขคู่แรก (lat, long) มาวาง</p>
+  </div>;
+}
+
 function AdminView(){
   const {tickets,updateTicket,removeTicket,setTripsAll,trips,updateTrip,history,addHistory,setHistoryAll,setCall,calling,requestSpeak,statuses,addStatus,playlist,playMode,addVideo,removeVideo,setMode,geofence,setGeofenceVal} = useContext(Store);
   const [tab,setTab] = useState('all');
+  const [showGeo,setShowGeo] = useState(false);
   const fileRef = useRef();
   const histRef = useRef();
 
@@ -889,21 +948,11 @@ function AdminView(){
           const name=prompt('เพิ่มสถานะใหม่ (พิมพ์ชื่อสถานะ):');
           if(name){ const ok=addStatus(name); alert(ok?'เพิ่มสถานะ "'+name.trim()+'" แล้ว':'มีสถานะนี้อยู่แล้ว หรือชื่อว่าง'); }
         }} className="bg-[var(--amber)]/15 text-[var(--amber)] border border-[var(--amber)]/40 hover:bg-[var(--amber)]/25 px-4 py-2 rounded-xl text-sm transition">➕ เพิ่มสถานะ</button>
-        <button onClick={async()=>{
-          if(geofence && geofence.lat){
-            if(confirm(`จุดรับคิวปัจจุบัน:\nพิกัด ${geofence.lat.toFixed(5)}, ${geofence.lng.toFixed(5)}\nรัศมี ${geofence.radius||500} เมตร\n\nกด OK เพื่อตั้งใหม่ (ตำแหน่งปัจจุบัน) · กด Cancel เพื่อปิดการเช็คระยะ`)){
-              try{ const pos=await getCurrentPos(); const rad=prompt('รัศมีที่อนุญาต (เมตร):','500'); setGeofenceVal({lat:pos.lat,lng:pos.lng,radius:parseInt(rad)||500}); alert('ตั้งจุดรับคิวใหม่แล้ว'); }
-              catch(e){ alert('ดึงตำแหน่งไม่สำเร็จ: อนุญาตการเข้าถึง GPS ก่อน'); }
-            } else { setGeofenceVal(null); alert('ปิดการเช็คระยะแล้ว — ลูกค้ากดรับคิวได้จากทุกที่'); }
-          } else {
-            if(confirm('ตั้งจุดรับคิวจากตำแหน่งปัจจุบัน?\n(ลูกค้ารถลูกค้าจะกดรับคิวได้เมื่ออยู่ในระยะที่กำหนดเท่านั้น)')){
-              try{ const pos=await getCurrentPos(); const rad=prompt('รัศมีที่อนุญาต (เมตร):','500'); setGeofenceVal({lat:pos.lat,lng:pos.lng,radius:parseInt(rad)||500}); alert('ตั้งจุดรับคิวแล้ว'); }
-              catch(e){ alert('ดึงตำแหน่งไม่สำเร็จ: อนุญาตการเข้าถึง GPS ก่อน'); }
-            }
-          }
-        }} className={`px-4 py-2 rounded-xl text-sm transition border ${geofence&&geofence.lat?'bg-[var(--teal)]/15 text-[var(--teal)] border-[var(--teal)]/40':'bg-[var(--panel2)] border-[var(--line)] hover:border-[var(--teal)]'}`}>📍 {geofence&&geofence.lat?`จุดรับคิว (${geofence.radius||500}ม.)`:'ตั้งจุดรับคิว'}</button>
+        <button onClick={()=>setShowGeo(v=>!v)} className={`px-4 py-2 rounded-xl text-sm transition border ${geofence&&geofence.lat?'bg-[var(--teal)]/15 text-[var(--teal)] border-[var(--teal)]/40':'bg-[var(--panel2)] border-[var(--line)] hover:border-[var(--teal)]'}`}>📍 {geofence&&geofence.lat?`จุดรับคิว (${geofence.radius||500}ม.)`:'ตั้งจุดรับคิว'}</button>
       </div>
     </div>
+
+    {showGeo && <GeofencePanel geofence={geofence} setGeofenceVal={setGeofenceVal} onClose={()=>setShowGeo(false)} />}
 
     <div className="flex gap-2 mb-4 flex-wrap">
       <button onClick={()=>setTab('all')} className={`tabbtn px-5 py-2 rounded-xl font-semibold text-sm ${tab==='all'?'bg-[var(--amber)] text-black':'bg-[var(--panel)] border border-[var(--line)]'}`}>คิวทั้งหมด ({tickets.length})</button>
