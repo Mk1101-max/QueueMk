@@ -605,7 +605,7 @@ function ExternalForm({onBack,onSubmit}){
               <div key={i} className="grid grid-cols-2 gap-2">
                 <select className={inputCls+' py-2.5'} value={it.product} onChange={e=>setItem(i,'product',e.target.value)}>
                   <option value="">— ชนิดน้ำมัน {i+1} —</option>
-                  {['ดีเซล','เบนซิน 95','แก๊สโซฮอล์ 91','แก๊สโซฮอล์ 95','แก๊สโซฮอล์ E20'].map(o=><option key={o}>{o}</option>)}
+                  {['ดีเซล','เบนซิน','แก๊สโซฮอล์ 91','แก๊สโซฮอล์ 95','แก๊สโซฮอล์ E20'].map(o=><option key={o}>{o}</option>)}
                 </select>
                 <input className={inputCls+' py-2.5'} value={it.volume} onChange={e=>setItem(i,'volume',e.target.value)} placeholder="ปริมาณ (ลิตร)" />
               </div>
